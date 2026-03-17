@@ -1,0 +1,401 @@
+Design a complete multi-page product wireframe for an AI learning platform called LearnLoop.
+
+The application helps students deeply understand concepts by studying notes, interacting with an AI tutor, using flashcards, and teaching concepts back to the AI using the Feynman learning technique.
+
+This is not a marketing landing page.
+Design a full SaaS application interface with multiple screens.
+
+Use a clean modern product layout similar to Notion, Linear, and Miro.
+
+Include:
+
+• Left sidebar navigation
+• Top navigation bar
+• Main workspace area
+• Secondary panels where needed
+
+Use simple wireframe components (boxes, text blocks, icons).
+
+Pages to Design
+
+Create separate wireframes for each page.
+
+1. Login / Signup Page
+
+Purpose: User authentication.
+
+Layout:
+
+Left side
+• Illustration or product visual
+• App name: LearnLoop
+• Tagline: Learn by Teaching AI
+
+Right side
+Authentication card
+
+Components:
+
+• Google Sign-In button
+• Email field
+• Password field
+• Login button
+• Register link
+
+Register screen should include:
+
+• Name
+• Email
+• Password
+• Confirm password
+
+2. Main Dashboard
+
+Purpose: Central home screen after login.
+
+Layout:
+
+Left Sidebar
+Navigation menu
+
+Main Content Area
+Dashboard widgets
+
+Sidebar items:
+
+• Dashboard
+• My Notes
+• Flashcards
+• Feynman Sessions
+• Progress Analytics
+• Settings
+
+Main dashboard components:
+
+Recent Notes Section
+Cards showing:
+
+• Document name
+• File type icon
+• Last opened date
+• Completion percentage ring
+
+Example card:
+
+Thermodynamics.pdf
+Progress: 72%
+
+Search bar at top of dashboard
+
+Quick actions:
+
+• Upload document
+• Create folder
+• Start new learning session
+
+Additional widgets:
+
+• Learning progress chart
+• Weekly study streak
+• Recently completed Feynman sessions
+
+3. Documents & Folder Explorer
+
+Purpose: Organize study materials.
+
+Layout:
+
+Left Sidebar
+Navigation
+
+Main Panel
+Document explorer
+
+Top area:
+
+• Search bar
+• Upload button
+• New Folder button
+
+Main section shows folders and files.
+
+Folder cards:
+
+• Folder name
+• Number of files
+
+Document cards:
+
+• File icon
+• File name
+• Completion percentage
+• Last studied
+
+Supported file indicators:
+
+PDF
+PPT
+DOC
+Image
+
+Allow grid layout or list layout.
+
+4. Document Study Workspace
+
+Purpose: Core learning interface.
+
+Layout:
+
+Top section
+Mind Map visualization
+
+Middle section
+AI Academic Copilot
+
+Right side panel
+Learning tools
+
+Mind Map section:
+
+AI-generated concept map from document.
+
+Nodes show:
+
+• main topic
+• subtopics
+
+Nodes should be clickable.
+
+AI Academic Copilot section:
+
+Chat style interface.
+
+User can ask:
+
+• questions about document
+• concept explanations
+• examples
+• summaries
+
+Chat components:
+
+• conversation area
+• input field
+• ask button
+
+Optional quick buttons:
+
+Explain simply
+Give example
+Generate quiz
+
+Right panel tools:
+
+Tabs:
+
+Flashcards
+Feynman Mode
+Notes
+
+5. Flashcards Interface
+
+Purpose: Concept review.
+
+Layout:
+
+Center area:
+
+Flashcard deck.
+
+Flashcard design:
+
+Front side
+Question
+
+Back side
+Answer
+
+Controls:
+
+• Flip card
+• Next card
+• Previous card
+• Mark known
+• Mark difficult
+
+Progress indicator:
+
+Card 3 / 20
+
+6. Feynman Mode Interface
+
+Purpose: Teach the AI.
+
+Layout:
+
+Conversation style interface.
+
+Top section:
+
+Concept being tested.
+
+Example:
+
+Topic: Entropy
+
+Main interaction area:
+
+AI message:
+
+“I am confused about entropy. Can you explain it to me like I am a beginner?”
+
+User response input box.
+
+Support:
+
+• Text explanation
+• Voice explanation
+
+Conversation continues with follow-up questions from AI.
+
+Example:
+
+“What does entropy increase mean in simple terms?”
+
+7. Feynman Evaluation Results Page
+
+Purpose: Show learning feedback.
+
+Layout:
+
+Summary panel.
+
+Components:
+
+Understanding Score (large)
+
+Example:
+
+Understanding Score
+72%
+
+Breakdown charts:
+
+• Concept Accuracy
+• Clarity
+• Completeness
+• Teaching Ability
+
+Feedback section:
+
+Strengths
+Example:
+
+Clear explanation of concept basics
+
+Improvement points:
+
+• Missing explanation of entropy formula
+• Need example of real-world entropy
+
+Buttons:
+
+• Retry explanation
+• Review weak concepts
+
+8. Progress Analytics Page
+
+Purpose: Track learning growth.
+
+Layout:
+
+Dashboard style.
+
+Charts:
+
+Topic mastery chart
+
+Example:
+
+| Topic | Score |
+Thermodynamics | 72%
+Entropy | 60%
+Heat Transfer | 85%
+
+Visualizations:
+
+• progress bar per topic
+• study time graph
+• mastery improvement timeline
+
+Additional section:
+
+Recent learning sessions.
+
+9. Settings Page
+
+User settings.
+
+Components:
+
+Profile info:
+
+• Name
+• Email
+• Education level
+
+Preferences:
+
+• Dark mode toggle
+• Study reminder notifications
+
+Account options:
+
+• Change password
+• Logout
+
+Design Style
+
+Wireframe only (low fidelity).
+
+Use:
+
+• simple rectangles
+• placeholder text
+• icon placeholders
+
+Layout inspiration:
+
+Notion
+Linear
+Miro
+
+Focus on:
+
+• productivity layout
+• AI interaction workspace
+• document learning workflow
+
+Avoid marketing style landing pages.
+
+Design a real product interface.
+
+Total Pages to Generate
+
+Login / Signup
+
+Dashboard
+
+Documents Explorer
+
+Document Study Workspace
+
+Flashcards
+
+Feynman Mode
+
+Feynman Evaluation Results
+
+Progress Analytics
+
+Settings
