@@ -151,6 +151,7 @@ export function DocumentWorkspace() {
             extractedText: document.extracted_text,
             question,
             userNotes: notes,
+            sections: document.sections,
           })
         : "";
 

@@ -1,48 +1,90 @@
+import { Suspense, lazy } from "react";
 import { createBrowserRouter } from "react-router";
-import { RootLayout } from "./components/RootLayout";
-import { ProtectedRoute } from "./components/ProtectedRoute";
-import { PublicOnlyRoute } from "./components/PublicOnlyRoute";
-import { LoginPage } from "./pages/LoginPage";
-import { SignupPage } from "./pages/SignupPage";
-import { Dashboard } from "./pages/Dashboard";
-import { DocumentsExplorer } from "./pages/DocumentsExplorer";
-import { DocumentWorkspace } from "./pages/DocumentWorkspace";
-import { FlashcardsPage } from "./pages/FlashcardsPage";
-import { FeynmanMode } from "./pages/FeynmanMode";
-import { FeynmanResults } from "./pages/FeynmanResults";
-import { ProgressAnalytics } from "./pages/ProgressAnalytics";
-import { SettingsPage } from "./pages/SettingsPage";
+
+const RootLayout = lazy(() =>
+  import("./components/RootLayout").then((module) => ({ default: module.RootLayout })),
+);
+const ProtectedRoute = lazy(() =>
+  import("./components/ProtectedRoute").then((module) => ({ default: module.ProtectedRoute })),
+);
+const PublicOnlyRoute = lazy(() =>
+  import("./components/PublicOnlyRoute").then((module) => ({ default: module.PublicOnlyRoute })),
+);
+const LoginPage = lazy(() =>
+  import("./pages/LoginPage").then((module) => ({ default: module.LoginPage })),
+);
+const SignupPage = lazy(() =>
+  import("./pages/SignupPage").then((module) => ({ default: module.SignupPage })),
+);
+const Dashboard = lazy(() =>
+  import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })),
+);
+const DocumentsExplorer = lazy(() =>
+  import("./pages/DocumentsExplorer").then((module) => ({ default: module.DocumentsExplorer })),
+);
+const DocumentWorkspace = lazy(() =>
+  import("./pages/DocumentWorkspace").then((module) => ({ default: module.DocumentWorkspace })),
+);
+const FlashcardsPage = lazy(() =>
+  import("./pages/FlashcardsPage").then((module) => ({ default: module.FlashcardsPage })),
+);
+const FeynmanMode = lazy(() =>
+  import("./pages/FeynmanMode").then((module) => ({ default: module.FeynmanMode })),
+);
+const FeynmanResults = lazy(() =>
+  import("./pages/FeynmanResults").then((module) => ({ default: module.FeynmanResults })),
+);
+const ProgressAnalytics = lazy(() =>
+  import("./pages/ProgressAnalytics").then((module) => ({ default: module.ProgressAnalytics })),
+);
+const SettingsPage = lazy(() =>
+  import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })),
+);
+
+function RouteLoader() {
+  return <div className="p-8 text-sm text-gray-500">Loading...</div>;
+}
+
+function withSuspense(Component: React.ComponentType) {
+  return function SuspendedRouteComponent() {
+    return (
+      <Suspense fallback={<RouteLoader />}>
+        <Component />
+      </Suspense>
+    );
+  };
+}
 
 export const router = createBrowserRouter([
   {
-    Component: PublicOnlyRoute,
+    Component: withSuspense(PublicOnlyRoute),
     children: [
       {
         path: "/login",
-        Component: LoginPage,
+        Component: withSuspense(LoginPage),
       },
       {
         path: "/signup",
-        Component: SignupPage,
+        Component: withSuspense(SignupPage),
       },
     ],
   },
   {
-    Component: ProtectedRoute,
+    Component: withSuspense(ProtectedRoute),
     children: [
       {
         path: "/",
-        Component: RootLayout,
+        Component: withSuspense(RootLayout),
         children: [
-          { index: true, Component: Dashboard },
-          { path: "notes", Component: DocumentsExplorer },
-          { path: "notes/:documentId", Component: DocumentWorkspace },
-          { path: "notes/:documentId/feynman", Component: FeynmanMode },
-          { path: "notes/:documentId/feynman/:sessionId/results", Component: FeynmanResults },
-          { path: "flashcards", Component: FlashcardsPage },
-          { path: "flashcards/:deckId", Component: FlashcardsPage },
-          { path: "analytics", Component: ProgressAnalytics },
-          { path: "settings", Component: SettingsPage },
+          { index: true, Component: withSuspense(Dashboard) },
+          { path: "notes", Component: withSuspense(DocumentsExplorer) },
+          { path: "notes/:documentId", Component: withSuspense(DocumentWorkspace) },
+          { path: "notes/:documentId/feynman", Component: withSuspense(FeynmanMode) },
+          { path: "notes/:documentId/feynman/:sessionId/results", Component: withSuspense(FeynmanResults) },
+          { path: "flashcards", Component: withSuspense(FlashcardsPage) },
+          { path: "flashcards/:deckId", Component: withSuspense(FlashcardsPage) },
+          { path: "analytics", Component: withSuspense(ProgressAnalytics) },
+          { path: "settings", Component: withSuspense(SettingsPage) },
         ],
       },
     ],

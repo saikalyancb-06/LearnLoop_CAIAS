@@ -14,16 +14,16 @@ function buildQuestions(topic: string, extractedText: string | null) {
 
   if (sentences.length === 0) {
     return [
-      `Can you explain ${topic} like I am a beginner?`,
-      `What real-world example helps you understand ${topic}?`,
-      `What part of ${topic} still feels unclear?`,
+      "Can you explain the main idea from this uploaded document like I am a beginner?",
+      "What real-world example from the document would help teach this better?",
+      "What part of the document still feels unclear or incomplete in your explanation?",
     ];
   }
 
   return [
-    `Can you teach ${topic} using simple language?`,
-    `How would you connect ${topic} to this idea: ${sentences[0]}?`,
-    `What would you improve in your explanation of ${topic}?`,
+    `Start by explaining this idea from the document in simple language: ${sentences[0]}`,
+    "What important point from the document did you leave out, and how would you add it now?",
+    "Give one concrete example from the document and explain why it matters.",
   ];
 }
 
@@ -57,27 +57,43 @@ function fallbackStrengths() {
   ];
 }
 
+function buildFallbackSessionSummary(input: {
+  topic: string;
+  previousSummary: string | null;
+  messages: Array<{ role: string; content: string }>;
+}) {
+  const latestUserMessage = [...input.messages].reverse().find((message) => message.role === "user")?.content ?? "";
+  const latestAiMessage = [...input.messages].reverse().find((message) => message.role === "ai")?.content ?? "";
+  const trimmedSummary = input.previousSummary?.trim();
+
+  return [
+    trimmedSummary,
+    `Topic: ${input.topic}.`,
+    latestUserMessage ? `Latest student explanation: ${latestUserMessage.slice(0, 280)}` : null,
+    latestAiMessage ? `Latest tutor prompt: ${latestAiMessage.slice(0, 200)}` : null,
+    "Focus next on misconceptions, missing links, and one concrete example.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export const feynmanService = {
-  async getOrCreateSession(input: {
+  async createSession(input: {
     documentId: string;
     userId: string;
     topic: string;
   }) {
-    const { data: existing, error: existingError } = await supabase
+    const { error: archiveError } = await supabase
       .from("feynman_sessions")
-      .select("*")
+      .update({
+        status: "archived",
+      })
       .eq("document_id", input.documentId)
       .eq("user_id", input.userId)
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .maybeSingle();
+      .eq("status", "active");
 
-    if (existingError) {
-      throw existingError;
-    }
-
-    if (existing) {
-      return existing;
+    if (archiveError) {
+      throw archiveError;
     }
 
     const { data: session, error: sessionError } = await supabase
@@ -86,6 +102,7 @@ export const feynmanService = {
         document_id: input.documentId,
         user_id: input.userId,
         topic: input.topic,
+        session_summary: `Fresh session on ${input.topic}. No student explanation yet.`,
       })
       .select()
       .single();
@@ -103,6 +120,47 @@ export const feynmanService = {
     });
 
     return session;
+  },
+
+  async listSessions(input: {
+    documentId: string;
+    userId: string;
+  }) {
+    const { data: sessions, error: sessionsError } = await supabase
+      .from("feynman_sessions")
+      .select("*")
+      .eq("document_id", input.documentId)
+      .eq("user_id", input.userId)
+      .order("created_at", { ascending: false });
+
+    if (sessionsError) {
+      throw sessionsError;
+    }
+
+    if (sessions.length === 0) {
+      return [];
+    }
+
+    const { data: results, error: resultsError } = await supabase
+      .from("feynman_results")
+      .select("session_id, overall_score")
+      .in(
+        "session_id",
+        sessions.map((session) => session.id),
+      );
+
+    if (resultsError) {
+      throw resultsError;
+    }
+
+    const scoreBySessionId = new Map(
+      results.map((result) => [result.session_id, result.overall_score]),
+    );
+
+    return sessions.map((session) => ({
+      ...session,
+      overall_score: scoreBySessionId.get(session.id) ?? null,
+    }));
   },
 
   async getSessionWithMessages(sessionId: string) {
@@ -195,6 +253,37 @@ export const feynmanService = {
       throw messagesError;
     }
 
+    const { data: currentSession, error: currentSessionError } = await supabase
+      .from("feynman_sessions")
+      .select("session_summary")
+      .eq("id", input.sessionId)
+      .single();
+
+    if (currentSessionError) {
+      throw currentSessionError;
+    }
+
+    const updatedSummary = localAiService.isAvailable()
+      ? await localAiService
+          .updateFeynmanSessionSummary({
+            topic: input.topic,
+            extractedText: input.extractedText,
+            previousSummary: currentSession.session_summary,
+            conversation: messages,
+          })
+          .catch(() =>
+            buildFallbackSessionSummary({
+              topic: input.topic,
+              previousSummary: currentSession.session_summary,
+              messages,
+            }),
+          )
+      : buildFallbackSessionSummary({
+          topic: input.topic,
+          previousSummary: currentSession.session_summary,
+          messages,
+        });
+
     const userMessagesCount = messages.filter((message) => message.role === "user").length;
     const nextQuestion = questionFlow[Math.min(userMessagesCount, questionFlow.length - 1)];
     const completionPercent = Math.min(100, Math.round((userMessagesCount / questionFlow.length) * 100));
@@ -203,6 +292,7 @@ export const feynmanService = {
           .createFeynmanFollowUp({
             topic: input.topic,
             extractedText: input.extractedText,
+            sessionSummary: updatedSummary,
             conversation: messages,
             explanation: input.explanation,
             completionPercent,
@@ -226,7 +316,10 @@ export const feynmanService = {
 
     const { error: sessionError } = await supabase
       .from("feynman_sessions")
-      .update({ completion_percent: completionPercent })
+      .update({
+        completion_percent: completionPercent,
+        session_summary: updatedSummary,
+      })
       .eq("id", input.sessionId);
 
     if (sessionError) {
@@ -259,12 +352,16 @@ export const feynmanService = {
           .evaluateFeynman({
             topic: session.topic,
             extractedText: document.extracted_text,
+            sessionSummary: session.session_summary,
             conversation: messages,
           })
           .catch(() => null)
       : null;
+    const misconceptions = aiEvaluation?.misconceptions.length
+      ? aiEvaluation.misconceptions
+      : [];
     const improvementPoints = aiEvaluation?.improvementPoints.length
-      ? aiEvaluation.improvementPoints
+      ? [...misconceptions, ...aiEvaluation.improvementPoints].slice(0, 5)
       : fallbackImprovementPoints();
     const strengths = aiEvaluation?.strengths.length ? aiEvaluation.strengths : fallbackStrengths();
 
@@ -280,7 +377,11 @@ export const feynmanService = {
         strengths,
         improvement_points: improvementPoints,
         ai_feedback:
-          aiEvaluation?.summary ??
+          aiEvaluation
+            ? [aiEvaluation.summary, misconceptions.length ? `Specific issues: ${misconceptions.join(" ")}` : null]
+                .filter(Boolean)
+                .join(" ")
+            : 
           `You made solid progress explaining ${session.topic}. Focus on sharper examples and more complete step-by-step teaching next time.`,
       })
       .select()

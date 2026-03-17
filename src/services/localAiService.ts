@@ -14,6 +14,8 @@ type ChatCompletionResponse = {
   }>;
 };
 
+type Provider = "ollama" | "groq";
+
 type FeynmanEvaluation = {
   overallScore: number;
   conceptAccuracy: number;
@@ -22,6 +24,7 @@ type FeynmanEvaluation = {
   teachingAbility: number;
   strengths: string[];
   improvementPoints: string[];
+  misconceptions: string[];
   summary: string;
 };
 
@@ -80,24 +83,32 @@ function readChoiceContent(payload: ChatCompletionResponse) {
 }
 
 async function createChatCompletion(messages: ChatMessage[], responseFormat?: { type: "json_object" }) {
-  if (!env.localAiEnabled || !env.localAiBaseUrl) {
-    throw new Error("Local AI is disabled.");
+  const provider = env.aiProvider as Provider;
+  const isOllama = provider === "ollama";
+  const baseUrl = isOllama ? env.localAiBaseUrl : env.groqBaseUrl;
+
+  if (!baseUrl || (isOllama && !env.localAiEnabled) || (!isOllama && !env.groqApiKey)) {
+    throw new Error("AI provider is not configured.");
   }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.localAiTimeoutMs);
 
   try {
-    const response = await fetch(`${env.localAiBaseUrl}/chat/completions`, {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        ...(isOllama ? {} : { Authorization: `Bearer ${env.groqApiKey}` }),
       },
       body: JSON.stringify({
-        model: env.localAiModel,
+        model: isOllama ? env.localAiModel : env.groqModel,
         temperature: 0.2,
         messages,
         response_format: responseFormat,
+        max_tokens: 500,
+        stream: false,
+        ...(isOllama ? { keep_alive: env.localAiKeepAlive } : {}),
       }),
       signal: controller.signal,
     });
@@ -121,9 +132,103 @@ function limitContext(text: string | null | undefined, maxLength = 6000) {
   return normalized.slice(0, maxLength);
 }
 
+function trimList(value: unknown, limit = 4) {
+  return Array.isArray(value)
+    ? value.map((item) => normalizeText(item)).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function tokenize(value: string) {
+  return normalizeText(value)
+    .toLowerCase()
+    .match(/[a-z0-9]{3,}/g) ?? [];
+}
+
+function selectRelevantPassages(input: {
+  query: string;
+  extractedText?: string | null;
+  sections?: Array<{ title?: string | null; content: string }>;
+  limit?: number;
+}) {
+  const limit = input.limit ?? 5;
+  const queryTokens = new Set(tokenize(input.query));
+  const sectionCandidates =
+    input.sections?.map((section) => ({
+      text: [section.title, section.content].filter(Boolean).join("\n"),
+    })) ?? [];
+
+  const fallbackChunks =
+    sectionCandidates.length > 0
+      ? sectionCandidates
+      : limitContext(input.extractedText, 5000)
+          .split(/\n{2,}/)
+          .map((chunk) => ({ text: chunk.trim() }))
+          .filter((chunk) => chunk.text);
+
+  const scored = fallbackChunks
+    .map((chunk) => {
+      const chunkTokens = tokenize(chunk.text);
+      const overlap = chunkTokens.filter((token) => queryTokens.has(token)).length;
+      return { ...chunk, score: overlap };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const selected = scored.slice(0, limit).map((chunk) => chunk.text).filter(Boolean);
+  return selected.length ? selected.join("\n\n") : limitContext(input.extractedText, 3500);
+}
+
 export const localAiService = {
   isAvailable() {
-    return env.localAiEnabled && Boolean(env.localAiBaseUrl);
+    return env.aiProvider === "groq"
+      ? Boolean(env.groqBaseUrl && env.groqApiKey)
+      : env.localAiEnabled && Boolean(env.localAiBaseUrl);
+  },
+
+  async getStatus() {
+    if (!this.isAvailable()) {
+      return {
+        connected: false,
+        model: env.aiProvider === "groq" ? env.groqModel : env.localAiModel,
+        provider: env.aiProvider,
+        mode: "disabled" as const,
+      };
+    }
+
+    try {
+      const provider = env.aiProvider as Provider;
+      const isOllama = provider === "ollama";
+      const response = await fetch(
+        `${isOllama ? env.localAiBaseUrl : env.groqBaseUrl}/models`,
+        {
+          headers: isOllama ? undefined : { Authorization: `Bearer ${env.groqApiKey}` },
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to reach local AI.");
+      }
+
+      const payload = (await response.json()) as {
+        data?: Array<{ id?: string }>;
+      };
+      const availableModels = payload.data?.map((model) => model.id).filter(Boolean) ?? [];
+
+      return {
+        connected: true,
+        model: isOllama ? env.localAiModel : env.groqModel,
+        provider,
+        mode: availableModels.includes(isOllama ? env.localAiModel : env.groqModel)
+          ? ("live" as const)
+          : ("fallback" as const),
+      };
+    } catch {
+      return {
+        connected: false,
+        model: env.aiProvider === "groq" ? env.groqModel : env.localAiModel,
+        provider: env.aiProvider,
+        mode: "fallback" as const,
+      };
+    }
   },
 
   async askCopilot(input: {
@@ -131,18 +236,26 @@ export const localAiService = {
     extractedText: string | null;
     question: string;
     userNotes?: string | null;
+    sections?: Array<{ title?: string | null; content: string }>;
   }) {
+    const relevantContext = selectRelevantPassages({
+      query: input.question,
+      extractedText: input.extractedText,
+      sections: input.sections,
+      limit: 5,
+    });
+
     const payload = await createChatCompletion([
       {
         role: "system",
-        content:
+          content:
           "You are LearnLoop's academic copilot. Answer only from the provided study material and user notes. Be concise, direct, and helpful. If the material is insufficient, say so clearly.",
       },
       {
         role: "user",
         content: [
           `Document title: ${input.documentTitle}`,
-          `Study material:\n${limitContext(input.extractedText, 7000) || "No extracted text available."}`,
+          `Relevant study material:\n${relevantContext || "No extracted text available."}`,
           `User notes:\n${limitContext(input.userNotes ?? "", 2000) || "No notes yet."}`,
           `Question: ${input.question}`,
         ].join("\n\n"),
@@ -206,12 +319,12 @@ export const localAiService = {
       {
         role: "system",
         content:
-          "You are a Feynman study coach. Ask one short opening question that gets the student to explain the topic in simple language. Do not ask multiple questions.",
+          "You are a Feynman study coach. Ask one short opening question that gets the student to explain the actual content of the uploaded document in simple language. Ignore generic chapter names, filenames, and labels like UNIT3DBMS. Do not ask what the title means. Do not speculate from the title. Ask about the ideas present in the reference material only.",
       },
       {
         role: "user",
         content: [
-          `Topic: ${input.topic}`,
+          `Content cue from the document: ${input.topic}`,
           `Study material:\n${limitContext(input.extractedText, 5000) || "No extracted text available."}`,
         ].join("\n\n"),
       },
@@ -223,6 +336,7 @@ export const localAiService = {
   async createFeynmanFollowUp(input: {
     topic: string;
     extractedText: string | null;
+    sessionSummary: string | null;
     conversation: Array<{ role: string; content: string }>;
     explanation: string;
     completionPercent: number;
@@ -236,14 +350,15 @@ export const localAiService = {
       {
         role: "system",
         content:
-          "You are a Feynman study coach. Ask one focused follow-up question that probes understanding, missing details, or examples. If the student has covered enough and completion is near 100, reply with one short sentence telling them to complete the session for evaluation.",
+          "You are a strict Feynman study coach. Ask one focused follow-up question that targets misunderstandings, missing causal links, vague wording, or missing examples in the uploaded document content. Ignore generic chapter names, filenames, and labels like UNIT3DBMS. Never ask what the title means or infer concepts from the title alone. If the student has covered enough and completion is near 100, reply with one short sentence telling them to complete the session for evaluation.",
       },
       {
         role: "user",
         content: [
-          `Topic: ${input.topic}`,
+          `Content cue from the document: ${input.topic}`,
           `Completion percent: ${input.completionPercent}`,
-          `Study material:\n${limitContext(input.extractedText, 5000) || "No extracted text available."}`,
+          `Reference material:\n${limitContext(input.extractedText, 3500) || "No extracted text available."}`,
+          `Running session summary:\n${limitContext(input.sessionSummary, 1800) || "No prior summary yet."}`,
           `Recent conversation:\n${transcript || "No prior conversation."}`,
           `Latest student explanation:\n${limitContext(input.explanation, 2500)}`,
         ].join("\n\n"),
@@ -256,6 +371,7 @@ export const localAiService = {
   async evaluateFeynman(input: {
     topic: string;
     extractedText: string | null;
+    sessionSummary: string | null;
     conversation: Array<{ role: string; content: string }>;
   }) {
     const transcript = input.conversation
@@ -267,14 +383,15 @@ export const localAiService = {
         {
           role: "system",
           content:
-            "You evaluate a student's explanation of an academic topic. Return valid JSON only with this schema: {\"overall_score\":0,\"concept_accuracy\":0,\"clarity\":0,\"completeness\":0,\"teaching_ability\":0,\"strengths\":[\"string\"],\"improvement_points\":[\"string\"],\"summary\":\"string\"}",
+            "You evaluate a student's explanation of an academic topic. Compare the student's explanation against the reference material. Identify what was incorrect, what was missing, and what was vague. Return valid JSON only with this schema: {\"overall_score\":0,\"concept_accuracy\":0,\"clarity\":0,\"completeness\":0,\"teaching_ability\":0,\"strengths\":[\"string\"],\"misconceptions\":[\"string\"],\"improvement_points\":[\"string\"],\"summary\":\"string\"}",
         },
         {
           role: "user",
           content: [
-            `Topic: ${input.topic}`,
-            `Reference material:\n${limitContext(input.extractedText, 7000) || "No extracted text available."}`,
-            `Conversation transcript:\n${limitContext(transcript, 8000)}`,
+            `Content cue from the document: ${input.topic}`,
+            `Reference material:\n${limitContext(input.extractedText, 4000) || "No extracted text available."}`,
+            `Running session summary:\n${limitContext(input.sessionSummary, 2200) || "No prior summary yet."}`,
+            `Conversation transcript:\n${limitContext(transcript, 4500)}`,
           ].join("\n\n"),
         },
       ],
@@ -289,6 +406,7 @@ export const localAiService = {
       completeness?: unknown;
       teaching_ability?: unknown;
       strengths?: unknown;
+      misconceptions?: unknown;
       improvement_points?: unknown;
       summary?: unknown;
     }>(content);
@@ -297,12 +415,9 @@ export const localAiService = {
       return null;
     }
 
-    const strengths = Array.isArray(parsed.strengths)
-      ? parsed.strengths.map((item) => normalizeText(item)).filter(Boolean)
-      : [];
-    const improvementPoints = Array.isArray(parsed.improvement_points)
-      ? parsed.improvement_points.map((item) => normalizeText(item)).filter(Boolean)
-      : [];
+    const strengths = trimList(parsed.strengths);
+    const misconceptions = trimList(parsed.misconceptions);
+    const improvementPoints = trimList(parsed.improvement_points, 5);
 
     const evaluation: FeynmanEvaluation = {
       overallScore: clampScore(parsed.overall_score),
@@ -311,6 +426,7 @@ export const localAiService = {
       completeness: clampScore(parsed.completeness),
       teachingAbility: clampScore(parsed.teaching_ability),
       strengths,
+      misconceptions,
       improvementPoints,
       summary: normalizeText(parsed.summary),
     };
@@ -320,5 +436,43 @@ export const localAiService = {
     }
 
     return evaluation;
+  },
+
+  async updateFeynmanSessionSummary(input: {
+    topic: string;
+    extractedText: string | null;
+    previousSummary: string | null;
+    conversation: Array<{ role: string; content: string }>;
+  }) {
+    const transcript = input.conversation
+      .slice(-6)
+      .map((message) => `${message.role}: ${message.content}`)
+      .join("\n");
+
+    const payload = await createChatCompletion(
+      [
+        {
+          role: "system",
+          content:
+            "You maintain a compact study-session memory. Return valid JSON only with this schema: {\"session_summary\":\"string\"}. The summary must capture what the student understands, what is wrong, what is missing, and what the tutor should probe next. Keep it under 160 words.",
+        },
+        {
+          role: "user",
+          content: [
+            `Content cue from the document: ${input.topic}`,
+            `Reference material:\n${limitContext(input.extractedText, 3000) || "No extracted text available."}`,
+            `Previous summary:\n${limitContext(input.previousSummary, 1400) || "No prior summary yet."}`,
+            `Recent conversation:\n${transcript || "No recent conversation."}`,
+          ].join("\n\n"),
+        },
+      ],
+      { type: "json_object" },
+    );
+
+    const content = readChoiceContent(payload);
+    const parsed = extractJson<{ session_summary?: unknown }>(content);
+    const sessionSummary = normalizeText(parsed?.session_summary);
+
+    return sessionSummary || null;
   },
 };

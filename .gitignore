@@ -16,6 +16,7 @@ pids
 *.pid.lock
 
 # OS and Editor files
+**/.DS_Store
 .DS_Store # macOS
 .idea/    # JetBrains IDEs
 .vscode/  # VS Code (optional, if you have user-specific settings)

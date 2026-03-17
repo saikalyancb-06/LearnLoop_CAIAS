@@ -8,6 +8,7 @@ import {
   Settings 
 } from "lucide-react";
 import { useAuth } from "../../hooks/useAuth";
+import { LocalAiStatus } from "./LocalAiStatus";
 
 export function RootLayout() {
   const location = useLocation();
@@ -47,12 +48,15 @@ export function RootLayout() {
       <aside className="w-64 bg-white border-r border-gray-200 flex flex-col">
         {/* Logo */}
         <div className="p-6 border-b border-gray-200">
-          <Link to="/" className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
-              <GraduationCap className="w-5 h-5 text-white" />
-            </div>
-            <span className="font-semibold text-lg">LearnLoop</span>
-          </Link>
+          <div className="space-y-4">
+            <Link to="/" className="flex items-center gap-2">
+              <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
+                <GraduationCap className="w-5 h-5 text-white" />
+              </div>
+              <span className="font-semibold text-lg">LearnLoop</span>
+            </Link>
+            <LocalAiStatus />
+          </div>
         </div>
 
         {/* Navigation */}

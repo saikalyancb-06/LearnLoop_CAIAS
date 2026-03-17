@@ -297,6 +297,36 @@ export const documentsService = {
     return data;
   },
 
+  async renameDocument(documentId: string, title: string) {
+    const { data, error } = await supabase
+      .from("documents")
+      .update({ title })
+      .eq("id", documentId)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  },
+
+  async moveDocument(documentId: string, folderId: string | null) {
+    const { data, error } = await supabase
+      .from("documents")
+      .update({ folder_id: folderId })
+      .eq("id", documentId)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  },
+
   async markDocumentOpened(documentId: string) {
     const { data, error } = await supabase
       .from("documents")

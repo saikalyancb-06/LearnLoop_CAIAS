@@ -1,22 +1,60 @@
-import { Search, Upload, FolderPlus, FileText, Folder, Grid3x3, List, Pencil, Trash2 } from "lucide-react";
+import {
+  Search,
+  Upload,
+  FolderPlus,
+  FileText,
+  Folder,
+  Grid3x3,
+  List,
+  Pencil,
+  Trash2,
+  ArrowRightLeft,
+} from "lucide-react";
 import { Link } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../../hooks/useAuth";
 import { documentsService } from "../../services/documentsService";
 import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../../lib/cache";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../components/ui/dialog";
+
+type ExplorerDialogState =
+  | { type: "create-folder" }
+  | { type: "rename-folder"; folderId: string; currentName: string }
+  | { type: "delete-folder"; folderId: string; currentName: string }
+  | { type: "rename-document"; documentId: string; currentTitle: string }
+  | { type: "delete-document"; documentId: string; currentTitle: string }
+  | { type: "move-document"; documentId: string; currentTitle: string; currentFolderId: string | null }
+  | null;
 
 export function DocumentsExplorer() {
   const { user } = useAuth();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">(() => readSessionCache("documents.viewMode") ?? "grid");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(
+    () => readSessionCache("documents.viewMode") ?? "grid",
+  );
   const [search, setSearch] = useState(() => readSessionCache("documents.search") ?? "");
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(() => readSessionCache("documents.folderId"));
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(() =>
+    readSessionCache("documents.folderId"),
+  );
   const [folders, setFolders] = useState<any[]>(() => readSessionCache("documents.allFolders") ?? []);
-  const [childFolders, setChildFolders] = useState<any[]>(() => readSessionCache("documents.childFolders") ?? []);
+  const [childFolders, setChildFolders] = useState<any[]>(
+    () => readSessionCache("documents.childFolders") ?? [],
+  );
   const [folderPath, setFolderPath] = useState<any[]>(() => readSessionCache("documents.folderPath") ?? []);
   const [documents, setDocuments] = useState<any[]>(() => readSessionCache("documents.documents") ?? []);
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [isSubmittingDialog, setIsSubmittingDialog] = useState(false);
+  const [dialogState, setDialogState] = useState<ExplorerDialogState>(null);
+  const [dialogInputValue, setDialogInputValue] = useState("");
+  const [targetFolderId, setTargetFolderId] = useState<string>("root");
   const [error, setError] = useState<string | null>(null);
 
   async function loadExplorer() {
@@ -40,8 +78,9 @@ export function DocumentsExplorer() {
       setFolders(nextFolders);
       setChildFolders(nextDocuments.childFolders);
       setDocuments(nextDocuments.documents);
-      const nextFolderPath =
-        selectedFolderId ? await documentsService.getFolderPath(selectedFolderId, nextDocuments.allFolders) : [];
+      const nextFolderPath = selectedFolderId
+        ? await documentsService.getFolderPath(selectedFolderId, nextDocuments.allFolders)
+        : [];
       setFolderPath(nextFolderPath);
       writeSessionCache("documents.allFolders", nextFolders);
       writeSessionCache("documents.childFolders", nextDocuments.childFolders);
@@ -78,47 +117,31 @@ export function DocumentsExplorer() {
     writeSessionCache("documents.viewMode", viewMode);
   }, [viewMode]);
 
-  const handleCreateFolder = async () => {
-    if (!user) {
+  useEffect(() => {
+    if (!dialogState) {
+      setDialogInputValue("");
+      setTargetFolderId("root");
       return;
     }
 
-    const name = window.prompt("Folder name");
-
-    if (!name?.trim()) {
+    if (dialogState.type === "rename-folder") {
+      setDialogInputValue(dialogState.currentName);
       return;
     }
 
-    await documentsService.createFolder(user.id, name.trim(), selectedFolderId);
-    await loadExplorer();
-  };
-
-  const handleRenameFolder = async (folderId: string, currentName: string) => {
-    const nextName = window.prompt("Rename folder", currentName);
-
-    if (!nextName?.trim()) {
+    if (dialogState.type === "rename-document") {
+      setDialogInputValue(dialogState.currentTitle);
       return;
     }
 
-    await documentsService.renameFolder(folderId, nextName.trim());
-    await loadExplorer();
-  };
-
-  const handleDeleteFolder = async (folderId: string) => {
-    const confirmed = window.confirm("Delete this folder? Documents stay in your library.");
-
-    if (!confirmed) {
+    if (dialogState.type === "move-document") {
+      setTargetFolderId(dialogState.currentFolderId ?? "root");
       return;
     }
 
-    await documentsService.deleteFolder(folderId);
-
-    if (selectedFolderId === folderId) {
-      setSelectedFolderId(null);
-    }
-
-    await loadExplorer();
-  };
+    setDialogInputValue("");
+    setTargetFolderId("root");
+  }, [dialogState]);
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
@@ -143,9 +166,7 @@ export function DocumentsExplorer() {
       await loadExplorer();
     } catch (uploadError) {
       setError(
-        uploadError instanceof Error
-          ? uploadError.message
-          : "Unable to upload the document.",
+        uploadError instanceof Error ? uploadError.message : "Unable to upload the document.",
       );
     } finally {
       setIsUploading(false);
@@ -153,7 +174,75 @@ export function DocumentsExplorer() {
     }
   };
 
+  const handleDialogSubmit = async () => {
+    if (!dialogState || !user) {
+      return;
+    }
+
+    setIsSubmittingDialog(true);
+    setError(null);
+
+    try {
+      switch (dialogState.type) {
+        case "create-folder": {
+          if (!dialogInputValue.trim()) {
+            return;
+          }
+          await documentsService.createFolder(user.id, dialogInputValue.trim(), selectedFolderId);
+          break;
+        }
+        case "rename-folder": {
+          if (!dialogInputValue.trim()) {
+            return;
+          }
+          await documentsService.renameFolder(dialogState.folderId, dialogInputValue.trim());
+          break;
+        }
+        case "delete-folder": {
+          await documentsService.deleteFolder(dialogState.folderId);
+          if (selectedFolderId === dialogState.folderId) {
+            setSelectedFolderId(null);
+          }
+          break;
+        }
+        case "rename-document": {
+          if (!dialogInputValue.trim()) {
+            return;
+          }
+          await documentsService.renameDocument(dialogState.documentId, dialogInputValue.trim());
+          break;
+        }
+        case "delete-document": {
+          await documentsService.deleteDocument(dialogState.documentId);
+          break;
+        }
+        case "move-document": {
+          await documentsService.moveDocument(
+            dialogState.documentId,
+            targetFolderId === "root" ? null : targetFolderId,
+          );
+          break;
+        }
+      }
+
+      setDialogState(null);
+      await loadExplorer();
+    } catch (dialogError) {
+      setError(
+        dialogError instanceof Error
+          ? dialogError.message
+          : "Unable to complete that action.",
+      );
+    } finally {
+      setIsSubmittingDialog(false);
+    }
+  };
+
   const visibleDocuments = useMemo(() => documents, [documents]);
+  const moveTargets = useMemo(
+    () => folders.filter((folder) => folder.id !== selectedFolderId),
+    [folders, selectedFolderId],
+  );
 
   const getFileIcon = (type: string) => {
     const iconClass = "w-5 h-5";
@@ -173,6 +262,54 @@ export function DocumentsExplorer() {
         return <FileText className={iconClass} />;
     }
   };
+
+  const renderDocumentActions = (doc: any) => (
+    <div className="flex items-center gap-1">
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setDialogState({
+            type: "move-document",
+            documentId: doc.id,
+            currentTitle: doc.title,
+            currentFolderId: doc.folder_id,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <ArrowRightLeft className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setDialogState({
+            type: "rename-document",
+            documentId: doc.id,
+            currentTitle: doc.title,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <Pencil className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setDialogState({
+            type: "delete-document",
+            documentId: doc.id,
+            currentTitle: doc.title,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-red-600"
+      >
+        <Trash2 className="w-4 h-4" />
+      </button>
+    </div>
+  );
 
   return (
     <div className="h-full overflow-auto">
@@ -198,7 +335,7 @@ export function DocumentsExplorer() {
               <span>{isUploading ? "Uploading..." : "Upload Document"}</span>
             </button>
             <button
-              onClick={handleCreateFolder}
+              onClick={() => setDialogState({ type: "create-folder" })}
               className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
             >
               <FolderPlus className="w-4 h-4" />
@@ -269,7 +406,9 @@ export function DocumentsExplorer() {
               <div
                 key={folder.id}
                 className={`bg-white border rounded-xl p-5 hover:shadow-sm transition-all cursor-pointer ${
-                  selectedFolderId === folder.id ? "border-indigo-400" : "border-gray-200 hover:border-indigo-300"
+                  selectedFolderId === folder.id
+                    ? "border-indigo-400"
+                    : "border-gray-200 hover:border-indigo-300"
                 }`}
                 onClick={() => setSelectedFolderId(folder.id)}
               >
@@ -284,7 +423,11 @@ export function DocumentsExplorer() {
                         <button
                           onClick={(event) => {
                             event.stopPropagation();
-                            void handleRenameFolder(folder.id, folder.name);
+                            setDialogState({
+                              type: "rename-folder",
+                              folderId: folder.id,
+                              currentName: folder.name,
+                            });
                           }}
                           className="p-1 text-gray-400 hover:text-gray-700"
                         >
@@ -293,7 +436,11 @@ export function DocumentsExplorer() {
                         <button
                           onClick={(event) => {
                             event.stopPropagation();
-                            void handleDeleteFolder(folder.id);
+                            setDialogState({
+                              type: "delete-folder",
+                              folderId: folder.id,
+                              currentName: folder.name,
+                            });
                           }}
                           className="p-1 text-gray-400 hover:text-red-600"
                         >
@@ -335,7 +482,10 @@ export function DocumentsExplorer() {
                     <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
                       {getFileIcon(doc.mime_type)}
                     </div>
-                    <span className="text-xs text-gray-500 uppercase">{doc.mime_type.split("/").pop()}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-gray-500 uppercase">{doc.mime_type.split("/").pop()}</span>
+                      {renderDocumentActions(doc)}
+                    </div>
                   </div>
                   <h3 className="font-medium text-gray-900 mb-2 line-clamp-2">{doc.title}</h3>
                   <div className="flex items-center justify-between text-sm mb-3">
@@ -361,66 +511,120 @@ export function DocumentsExplorer() {
             </div>
           ) : (
             <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-              <table className="w-full">
-                <thead className="bg-gray-50 border-b border-gray-200">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Name
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Type
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Progress
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Last Studied
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200">
-                  {visibleDocuments.map((doc) => (
-                    <tr key={doc.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <Link to={`/notes/${doc.id}`} className="flex items-center gap-3 text-gray-900 hover:text-indigo-600">
-                          <div className="w-8 h-8 bg-gray-100 rounded flex items-center justify-center">
-                            {getFileIcon(doc.mime_type)}
-                          </div>
-                          <span className="font-medium">{doc.title}</span>
-                        </Link>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className="text-sm text-gray-500 uppercase">{doc.mime_type.split("/").pop()}</span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex items-center gap-3">
-                          <div className="w-32 bg-gray-200 rounded-full h-2">
-                            <div
-                              className="bg-indigo-600 h-2 rounded-full"
-                              style={{ width: `${doc.completion_percent}%` }}
-                            ></div>
-                          </div>
-                          <span className="text-sm font-medium text-indigo-600">{doc.completion_percent}%</span>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleString() : "Not yet"}
-                      </td>
-                    </tr>
-                  ))}
-                  {visibleDocuments.length === 0 ? (
-                    <tr>
-                      <td colSpan={4} className="px-6 py-8 text-center text-sm text-gray-500">
-                        No documents match this view yet.
-                      </td>
-                    </tr>
-                  ) : null}
-                </tbody>
-              </table>
+              {visibleDocuments.map((doc) => (
+                <Link
+                  key={doc.id}
+                  to={`/notes/${doc.id}`}
+                  className="flex items-center gap-4 px-6 py-4 border-b border-gray-100 last:border-b-0 hover:bg-gray-50"
+                >
+                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
+                    {getFileIcon(doc.mime_type)}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-gray-900 truncate">{doc.title}</div>
+                    <div className="text-sm text-gray-500">
+                      {doc.mime_type} • {doc.completion_percent}% complete
+                    </div>
+                  </div>
+                  <div className="text-sm text-gray-500">
+                    {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleDateString() : "Not studied"}
+                  </div>
+                  {renderDocumentActions(doc)}
+                </Link>
+              ))}
+              {visibleDocuments.length === 0 ? (
+                <div className="p-6 text-sm text-gray-500">No documents match this view yet.</div>
+              ) : null}
             </div>
           )}
         </div>
       </div>
+
+      <Dialog open={Boolean(dialogState)} onOpenChange={(open) => !open && setDialogState(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {dialogState?.type === "create-folder" && "Create Folder"}
+              {dialogState?.type === "rename-folder" && "Rename Folder"}
+              {dialogState?.type === "delete-folder" && "Delete Folder"}
+              {dialogState?.type === "rename-document" && "Rename Document"}
+              {dialogState?.type === "delete-document" && "Delete Document"}
+              {dialogState?.type === "move-document" && "Move Document"}
+            </DialogTitle>
+            <DialogDescription>
+              {dialogState?.type === "create-folder" && "Create a new folder in the current location."}
+              {dialogState?.type === "rename-folder" && "Update the folder name."}
+              {dialogState?.type === "delete-folder" && "This removes the folder structure. Documents remain in your library."}
+              {dialogState?.type === "rename-document" && "Update the document title shown across the app."}
+              {dialogState?.type === "delete-document" && "This removes the document, extracted content, and stored file."}
+              {dialogState?.type === "move-document" && "Move this document into another folder or back to the root."}
+            </DialogDescription>
+          </DialogHeader>
+
+          {dialogState?.type === "create-folder" ||
+          dialogState?.type === "rename-folder" ||
+          dialogState?.type === "rename-document" ? (
+            <input
+              type="text"
+              value={dialogInputValue}
+              onChange={(event) => setDialogInputValue(event.target.value)}
+              placeholder="Enter a name"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          ) : null}
+
+          {dialogState?.type === "move-document" ? (
+            <select
+              value={targetFolderId}
+              onChange={(event) => setTargetFolderId(event.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="root">Root / My Notes</option>
+              {moveTargets.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.name}
+                </option>
+              ))}
+            </select>
+          ) : null}
+
+          {dialogState?.type === "delete-folder" ? (
+            <div className="rounded-lg border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+              Delete folder "{dialogState.currentName}"?
+            </div>
+          ) : null}
+
+          {dialogState?.type === "delete-document" ? (
+            <div className="rounded-lg border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+              Delete document "{dialogState.currentTitle}"?
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <button
+              type="button"
+              onClick={() => setDialogState(null)}
+              className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleDialogSubmit()}
+              disabled={
+                isSubmittingDialog ||
+                ((dialogState?.type === "create-folder" ||
+                  dialogState?.type === "rename-folder" ||
+                  dialogState?.type === "rename-document") &&
+                  !dialogInputValue.trim())
+              }
+              className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSubmittingDialog ? "Saving..." : "Confirm"}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
