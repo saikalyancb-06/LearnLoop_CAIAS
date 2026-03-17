@@ -1,8 +1,50 @@
 import { supabase } from "../lib/supabaseClient";
 import { storageService } from "./storageService";
-import { processDocumentFile } from "./documentProcessing";
+import { generateFlashcardsFromText, processDocumentFile } from "./documentProcessing";
 import { progressService } from "./progressService";
 import { localAiService } from "./localAiService";
+
+function mapFlashcardsPayload(input: {
+  documentId: string;
+  userId: string;
+  flashcards: Array<{
+    question: string;
+    answer: string;
+    sortOrder?: number;
+    difficulty?: string;
+  }>;
+}) {
+  return input.flashcards.map((flashcard, index) => ({
+    document_id: input.documentId,
+    user_id: input.userId,
+    question: flashcard.question,
+    answer: flashcard.answer,
+    difficulty:
+      flashcard.difficulty === "hard"
+        ? "high"
+        : flashcard.difficulty === "medium"
+          ? "medium"
+          : null,
+    status: "unseen",
+    sort_order: flashcard.sortOrder ?? index,
+  }));
+}
+
+function shuffleWithSortOrder<T extends { sortOrder?: number }>(items: T[]) {
+  const shuffled = [...items];
+
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    const current = shuffled[index];
+    shuffled[index] = shuffled[swapIndex];
+    shuffled[swapIndex] = current;
+  }
+
+  return shuffled.map((item, index) => ({
+    ...item,
+    sortOrder: index,
+  }));
+}
 
 export const documentsService = {
   async listFolders(userId: string) {
@@ -208,19 +250,11 @@ export const documentsService = {
         sort_order: section.sortOrder,
       }));
 
-      const flashcardPayload = (aiFlashcards ?? processed.flashcards).map((flashcard, index) => ({
-        document_id: document.id,
-        user_id: input.userId,
-        question: flashcard.question,
-        answer: flashcard.answer,
-        difficulty:
-          "difficulty" in flashcard && flashcard.difficulty === "hard"
-            ? "high"
-            : "difficulty" in flashcard && flashcard.difficulty === "medium"
-              ? "medium"
-              : null,
-        sort_order: flashcard.sortOrder ?? index,
-      }));
+      const flashcardPayload = mapFlashcardsPayload({
+        documentId: document.id,
+        userId: input.userId,
+        flashcards: aiFlashcards ?? processed.flashcards,
+      });
 
       const [{ error: sectionsError }, { error: flashcardsError }] = await Promise.all([
         supabase.from("document_sections").insert(sectionsPayload),
@@ -367,5 +401,74 @@ export const documentsService = {
     if (error) {
       throw error;
     }
+  },
+
+  async regenerateFlashcards(input: {
+    documentId: string;
+    userId: string;
+  }) {
+    const { data: document, error: documentError } = await supabase
+      .from("documents")
+      .select("id, title, extracted_text")
+      .eq("id", input.documentId)
+      .eq("user_id", input.userId)
+      .single();
+
+    if (documentError) {
+      throw documentError;
+    }
+
+    const extractedText = typeof document.extracted_text === "string" ? document.extracted_text : "";
+    const fallbackFlashcards = generateFlashcardsFromText(
+      extractedText || document.title,
+      document.title,
+    );
+    const aiFlashcards =
+      localAiService.isAvailable() && extractedText
+        ? await localAiService
+            .generateFlashcards({
+              title: document.title,
+              extractedText,
+              regenerationNonce: new Date().toISOString(),
+            })
+            .catch(() => null)
+        : null;
+
+    const source = aiFlashcards ? "ai" : "fallback";
+    const nextFlashcards = shuffleWithSortOrder(aiFlashcards ?? fallbackFlashcards);
+
+    if (!nextFlashcards.length) {
+      throw new Error("No flashcards could be generated for this note.");
+    }
+
+    const flashcardPayload = mapFlashcardsPayload({
+      documentId: input.documentId,
+      userId: input.userId,
+      flashcards: nextFlashcards,
+    });
+
+    const { error: deleteError } = await supabase
+      .from("flashcards")
+      .delete()
+      .eq("document_id", input.documentId)
+      .eq("user_id", input.userId);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+
+    const { error: insertError } = await supabase.from("flashcards").insert(flashcardPayload);
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    // Regeneration should still succeed even if completion stats refresh fails.
+    await progressService.updateDocumentCompletion(input.documentId).catch(() => null);
+
+    return {
+      count: nextFlashcards.length,
+      source,
+    };
   },
 };

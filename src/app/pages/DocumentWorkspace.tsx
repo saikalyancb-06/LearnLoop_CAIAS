@@ -13,6 +13,114 @@ type ChatMessage = {
   content: string;
 };
 
+type MessagePart =
+  | { type: "text"; content: string }
+  | { type: "code"; content: string; language: string };
+
+function looksLikeFlattenedCode(content: string) {
+  const hasFewLineBreaks = content.split("\n").length <= 2;
+  const semicolonCount = (content.match(/;/g) ?? []).length;
+  const codeHintCount = [
+    /#include/i,
+    /\bstruct\b/i,
+    /\bclass\b/i,
+    /\bfunction\b/i,
+    /\breturn\b/i,
+    /\{/,
+    /\}/,
+  ].filter((pattern) => pattern.test(content)).length;
+
+  return hasFewLineBreaks && semicolonCount >= 4 && codeHintCount >= 3;
+}
+
+function inferCodeLanguage(content: string) {
+  if (/#include|printf|scanf|malloc|\bstruct\b/i.test(content)) {
+    return "c";
+  }
+
+  if (/function\s+\w+|\bconst\b|\blet\b|=>/.test(content)) {
+    return "javascript";
+  }
+
+  return "text";
+}
+
+function formatFlattenedCode(content: string) {
+  const withBreaks = content
+    .replace(/\{/g, "{\n")
+    .replace(/\}/g, "\n}\n")
+    .replace(/;\s*/g, ";\n")
+    .replace(/\n{3,}/g, "\n\n");
+
+  let indentLevel = 0;
+
+  return withBreaks
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      if (line.startsWith("}")) {
+        indentLevel = Math.max(0, indentLevel - 1);
+      }
+
+      const formattedLine = `${"  ".repeat(indentLevel)}${line}`;
+
+      if (line.endsWith("{")) {
+        indentLevel += 1;
+      }
+
+      return formattedLine;
+    })
+    .join("\n");
+}
+
+function parseMessageParts(content: string): MessagePart[] {
+  const codeBlockPattern = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+  const matches = [...content.matchAll(codeBlockPattern)];
+
+  if (matches.length === 0) {
+    if (looksLikeFlattenedCode(content)) {
+      return [
+        {
+          type: "code",
+          language: inferCodeLanguage(content),
+          content: formatFlattenedCode(content),
+        },
+      ];
+    }
+
+    return [{ type: "text", content }];
+  }
+
+  const parts: MessagePart[] = [];
+  let cursor = 0;
+
+  for (const match of matches) {
+    const matchIndex = match.index ?? 0;
+    const textBefore = content.slice(cursor, matchIndex);
+
+    if (textBefore.trim()) {
+      parts.push({ type: "text", content: textBefore.trim() });
+    }
+
+    parts.push({
+      type: "code",
+      language: (match[1] ?? "text").trim() || "text",
+      content: (match[2] ?? "").replace(/\n+$/, ""),
+    });
+
+    cursor = matchIndex + match[0].length;
+  }
+
+  const trailing = content.slice(cursor);
+
+  if (trailing.trim()) {
+    parts.push({ type: "text", content: trailing.trim() });
+  }
+
+  return parts.length ? parts : [{ type: "text", content }];
+}
+
 function buildCopilotReply(question: string, documentTitle: string, extractedText: string | null) {
   const summary = extractedText?.split("\n").slice(0, 2).join(" ") ?? "";
   const normalizedQuestion = question.toLowerCase();
@@ -25,7 +133,27 @@ function buildCopilotReply(question: string, documentTitle: string, extractedTex
     return `${documentTitle} in simple terms: start with the core idea, explain why it matters, and then use one short example. ${summary}`;
   }
 
-  return `Based on ${documentTitle}, focus on the main concepts captured in the document summary and sections. ${summary}`;
+  if (normalizedQuestion.includes("code") || normalizedQuestion.includes("program")) {
+    return [
+      `Structured explanation for ${documentTitle}:`,
+      "1. Identify the main purpose of the code and the key data structures.",
+      "2. Break logic into small steps: input, processing, and output.",
+      "3. Check edge cases and memory/error handling.",
+      summary ? `Reference clue from document: ${summary}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return [
+    `Based on ${documentTitle}, here is a structured answer:`,
+    "1. Main idea",
+    "2. Why it matters",
+    "3. One practical example",
+    summary ? `Reference clue from document: ${summary}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function DocumentWorkspace() {
@@ -276,7 +404,7 @@ export function DocumentWorkspace() {
             {document.sections.map((section: any) => (
               <div key={section.id} className="rounded-lg border border-gray-200 bg-white p-4">
                 <div className="text-sm font-medium text-gray-900">{section.title}</div>
-                <div className="mt-2 text-sm text-gray-500">{section.content}</div>
+                <div className="mt-2 whitespace-pre-wrap text-sm text-gray-500">{section.content}</div>
               </div>
             ))}
           </div>
@@ -303,7 +431,28 @@ export function DocumentWorkspace() {
                       : "bg-white border border-gray-200 text-gray-900"
                   }`}
                 >
-                  {message.content}
+                  {parseMessageParts(message.content).map((part, index) =>
+                    part.type === "code" ? (
+                      <div
+                        key={`${message.id}-code-${index}`}
+                        className="my-2 overflow-x-auto rounded-md border border-slate-700 bg-slate-950"
+                      >
+                        <div className="border-b border-slate-700 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                          {part.language}
+                        </div>
+                        <pre className="p-3 text-xs leading-6 text-slate-100">
+                          <code>{part.content}</code>
+                        </pre>
+                      </div>
+                    ) : (
+                      <p
+                        key={`${message.id}-text-${index}`}
+                        className="whitespace-pre-wrap break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
+                      >
+                        {part.content}
+                      </p>
+                    ),
+                  )}
                 </div>
               </div>
             ))}

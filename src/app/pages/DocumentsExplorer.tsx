@@ -14,7 +14,13 @@ import { Link } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "../../hooks/useAuth";
 import { documentsService } from "../../services/documentsService";
-import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../../lib/cache";
+import {
+  isSessionCacheFresh,
+  readSessionCache,
+  removeSessionCache,
+  writeSessionCache,
+} from "../../lib/cache";
+import { getDocumentTypeLabel } from "../../lib/documentDisplay";
 import {
   Dialog,
   DialogContent,
@@ -56,6 +62,12 @@ export function DocumentsExplorer() {
   const [dialogInputValue, setDialogInputValue] = useState("");
   const [targetFolderId, setTargetFolderId] = useState<string>("root");
   const [error, setError] = useState<string | null>(null);
+
+  const invalidateDashboardCache = () => {
+    removeSessionCache("dashboard.documents");
+    removeSessionCache("dashboard.sessions");
+    removeSessionCache("dashboard.summary");
+  };
 
   async function loadExplorer() {
     if (!user) {
@@ -163,6 +175,7 @@ export function DocumentsExplorer() {
         file,
         folderId: selectedFolderId,
       });
+      invalidateDashboardCache();
       await loadExplorer();
     } catch (uploadError) {
       setError(
@@ -183,6 +196,8 @@ export function DocumentsExplorer() {
     setError(null);
 
     try {
+      let didChangeDashboardDocuments = false;
+
       switch (dialogState.type) {
         case "create-folder": {
           if (!dialogInputValue.trim()) {
@@ -210,10 +225,12 @@ export function DocumentsExplorer() {
             return;
           }
           await documentsService.renameDocument(dialogState.documentId, dialogInputValue.trim());
+          didChangeDashboardDocuments = true;
           break;
         }
         case "delete-document": {
           await documentsService.deleteDocument(dialogState.documentId);
+          didChangeDashboardDocuments = true;
           break;
         }
         case "move-document": {
@@ -221,8 +238,13 @@ export function DocumentsExplorer() {
             dialogState.documentId,
             targetFolderId === "root" ? null : targetFolderId,
           );
+          didChangeDashboardDocuments = true;
           break;
         }
+      }
+
+      if (didChangeDashboardDocuments) {
+        invalidateDashboardCache();
       }
 
       setDialogState(null);
@@ -483,7 +505,9 @@ export function DocumentsExplorer() {
                       {getFileIcon(doc.mime_type)}
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs text-gray-500 uppercase">{doc.mime_type.split("/").pop()}</span>
+                      <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-indigo-700">
+                        {getDocumentTypeLabel(doc.mime_type, doc.original_filename)}
+                      </span>
                       {renderDocumentActions(doc)}
                     </div>
                   </div>
@@ -523,7 +547,7 @@ export function DocumentsExplorer() {
                   <div className="flex-1 min-w-0">
                     <div className="font-medium text-gray-900 truncate">{doc.title}</div>
                     <div className="text-sm text-gray-500">
-                      {doc.mime_type} • {doc.completion_percent}% complete
+                      {getDocumentTypeLabel(doc.mime_type, doc.original_filename)} • {doc.completion_percent}% complete
                     </div>
                   </div>
                   <div className="text-sm text-gray-500">

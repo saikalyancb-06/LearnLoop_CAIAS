@@ -11,6 +11,7 @@ type ChatCompletionResponse = {
     message?: {
       content?: string | Array<{ type?: string; text?: string }>;
     };
+    finish_reason?: string | null;
   }>;
 };
 
@@ -82,7 +83,21 @@ function readChoiceContent(payload: ChatCompletionResponse) {
   return "";
 }
 
-async function createChatCompletion(messages: ChatMessage[], responseFormat?: { type: "json_object" }) {
+function responseWasTruncated(payload: ChatCompletionResponse) {
+  const finishReason = payload.choices?.[0]?.finish_reason;
+
+  if (!finishReason) {
+    return false;
+  }
+
+  return finishReason === "length" || finishReason === "max_tokens";
+}
+
+async function createChatCompletion(
+  messages: ChatMessage[],
+  responseFormat?: { type: "json_object" },
+  options?: { maxTokens?: number; temperature?: number },
+) {
   const provider = env.aiProvider as Provider;
   const isOllama = provider === "ollama";
   const baseUrl = isOllama ? env.localAiBaseUrl : env.groqBaseUrl;
@@ -95,6 +110,9 @@ async function createChatCompletion(messages: ChatMessage[], responseFormat?: { 
   const timeout = setTimeout(() => controller.abort(), env.localAiTimeoutMs);
 
   try {
+    const maxTokens = Math.max(200, Math.min(1800, options?.maxTokens ?? 700));
+    const temperature = options?.temperature ?? 0.2;
+
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -103,10 +121,10 @@ async function createChatCompletion(messages: ChatMessage[], responseFormat?: { 
       },
       body: JSON.stringify({
         model: isOllama ? env.localAiModel : env.groqModel,
-        temperature: 0.2,
+        temperature,
         messages,
         response_format: responseFormat,
-        max_tokens: 500,
+        max_tokens: maxTokens,
         stream: false,
         ...(isOllama ? { keep_alive: env.localAiKeepAlive } : {}),
       }),
@@ -142,6 +160,106 @@ function tokenize(value: string) {
   return normalizeText(value)
     .toLowerCase()
     .match(/[a-z0-9]{3,}/g) ?? [];
+}
+
+const LOW_SIGNAL_TOKENS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "that",
+  "this",
+  "from",
+  "into",
+  "your",
+  "have",
+  "will",
+  "about",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "these",
+  "those",
+  "then",
+  "than",
+  "them",
+  "they",
+  "their",
+  "there",
+  "document",
+  "topic",
+  "concept",
+  "main",
+  "idea",
+  "explain",
+  "describe",
+]);
+
+function contentTokens(value: string) {
+  return tokenize(value).filter((token) => !LOW_SIGNAL_TOKENS.has(token));
+}
+
+function normalizeQuestion(value: unknown) {
+  const normalized = normalizeText(value).replace(/\s+/g, " ").trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (/[?]$/.test(normalized)) {
+    return normalized;
+  }
+
+  return `${normalized}?`;
+}
+
+function isGenericFlashcardQuestion(question: string) {
+  const normalized = question.trim().toLowerCase();
+
+  return [
+    /^how does .+ relate to .+\??$/i,
+    /^what is the main idea/i,
+    /^what does this document/i,
+    /^explain (this|the) (concept|topic)/i,
+    /^summarize (the )?(document|topic)/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function isFlashcardGrounded(input: {
+  question: string;
+  answer: string;
+  title: string;
+  materialTokens: Set<string>;
+}) {
+  if (isGenericFlashcardQuestion(input.question)) {
+    return false;
+  }
+
+  const questionTokens = contentTokens(input.question);
+  const answerTokens = contentTokens(input.answer);
+
+  if (questionTokens.length < 2 || answerTokens.length < 2) {
+    return false;
+  }
+
+  if (input.materialTokens.size === 0) {
+    return input.question.length > 24 && input.answer.length > 24;
+  }
+
+  const questionOverlap = questionTokens.filter((token) => input.materialTokens.has(token)).length;
+  const answerOverlap = answerTokens.filter((token) => input.materialTokens.has(token)).length;
+  const totalOverlap = questionOverlap + answerOverlap;
+
+  if (questionOverlap >= 1 && totalOverlap >= 3) {
+    return true;
+  }
+
+  const titleTokens = new Set(contentTokens(input.title));
+  const titleOverlap = questionTokens.filter((token) => titleTokens.has(token)).length;
+
+  return questionOverlap >= 1 && answerOverlap >= 1 && titleOverlap >= 1;
 }
 
 function selectRelevantPassages(input: {
@@ -245,11 +363,11 @@ export const localAiService = {
       limit: 5,
     });
 
-    const payload = await createChatCompletion([
+    const baseMessages: ChatMessage[] = [
       {
         role: "system",
-          content:
-          "You are LearnLoop's academic copilot. Answer only from the provided study material and user notes. Be concise, direct, and helpful. If the material is insufficient, say so clearly.",
+        content:
+          "You are LearnLoop's academic copilot. Answer only from the provided study material and user notes. Give clear, well-structured answers with short sections. Keep the response complete and concise unless the user explicitly asks for deep detail. When the user asks about source code or the material includes code, return a properly formatted fenced code block first, then explain it step by step in simple language. Do not invent missing APIs or facts. If the material is insufficient, say exactly what is missing.",
       },
       {
         role: "user",
@@ -257,78 +375,137 @@ export const localAiService = {
           `Document title: ${input.documentTitle}`,
           `Relevant study material:\n${relevantContext || "No extracted text available."}`,
           `User notes:\n${limitContext(input.userNotes ?? "", 2000) || "No notes yet."}`,
+          "Response format: start with the direct answer. If code is involved, include a cleaned code block and then a concise explanation of each important part.",
           `Question: ${input.question}`,
         ].join("\n\n"),
       },
-    ]);
+    ];
 
-    return readChoiceContent(payload);
+    const payload = await createChatCompletion(baseMessages, undefined, { maxTokens: 1200 });
+    let answer = readChoiceContent(payload);
+
+    if (answer && responseWasTruncated(payload)) {
+      const continuationPayload = await createChatCompletion(
+        [
+          ...baseMessages,
+          { role: "assistant", content: answer },
+          {
+            role: "user",
+            content:
+              "Continue exactly from where you stopped. Do not repeat previous lines. Finish the answer cleanly with a short final summary.",
+          },
+        ],
+        undefined,
+        { maxTokens: 700 },
+      ).catch(() => null);
+
+      const continuation = continuationPayload ? readChoiceContent(continuationPayload) : "";
+
+      if (continuation) {
+        answer = `${answer}\n\n${continuation}`;
+      }
+    }
+
+    return answer;
   },
 
   async generateFlashcards(input: {
     title: string;
     extractedText: string;
+    regenerationNonce?: string;
   }) {
-    const payload = await createChatCompletion(
-      [
-        {
-          role: "system",
-          content:
-            "You create concise academic flashcards from notes. Return valid JSON only with this schema: {\"flashcards\":[{\"question\":\"string\",\"answer\":\"string\",\"difficulty\":\"easy|medium|hard\"}]}",
-        },
-        {
-          role: "user",
-          content: [
-            `Title: ${input.title}`,
-            `Material:\n${limitContext(input.extractedText, 8000)}`,
-            "Generate 6 high-value flashcards that test core understanding, not trivia.",
-          ].join("\n\n"),
-        },
-      ],
-      { type: "json_object" },
-    );
+    // Retry with temperature variation if first attempt yields weak results
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const temperature = attempt === 0 ? 0.2 : 0.4; // second try is more creative
+      const materialExcerpt = limitContext(input.extractedText, 9000);
+      const materialTokens = new Set(contentTokens(materialExcerpt));
+      const payload = await createChatCompletion(
+        [
+          {
+            role: "system",
+            content:
+              "You create high-quality academic flashcards strictly grounded in supplied notes. Return valid JSON only with this schema: {\"flashcards\":[{\"question\":\"string\",\"answer\":\"string\",\"difficulty\":\"easy|medium|hard\"}]}. Rules: each question must reference a concrete concept, term, function, or process explicitly present in the notes; avoid generic prompts like 'How does X relate to Y?' or 'What is the main idea?'; answers must be factual, concise (1-2 sentences), and include at least one concrete detail from the notes.",
+          },
+          {
+            role: "user",
+            content: [
+              `Title: ${input.title}`,
+              `Material:\n${materialExcerpt}`,
+              input.regenerationNonce
+                ? `Regeneration run: ${input.regenerationNonce}. Create a fresh but still grounded set that focuses on different angles than a previous run.`
+                : "",
+              "Generate 6 relevant flashcards with varied focus across definitions, process flow, differences, and practical understanding. Keep each question specific and unambiguous.",
+            ].join("\n\n"),
+          },
+        ],
+        { type: "json_object" },
+        { maxTokens: 1300, temperature },
+      );
 
-    const content = readChoiceContent(payload);
-    const parsed = extractJson<{ flashcards?: Array<{ question?: unknown; answer?: unknown; difficulty?: unknown }> }>(content);
-    const flashcards = parsed?.flashcards
-      ?.map((card, index) => {
-        const question = normalizeText(card.question);
-        const answer = normalizeText(card.answer);
+      const content = readChoiceContent(payload);
+      const parsed = extractJson<{ flashcards?: Array<{ question?: unknown; answer?: unknown; difficulty?: unknown }> }>(content);
+      const flashcards = parsed?.flashcards
+        ?.map((card, index) => {
+          const question = normalizeQuestion(card.question);
+          const answer = normalizeText(card.answer).replace(/\s+/g, " ").trim();
 
-        if (!question || !answer) {
-          return null;
-        }
+          if (!question || !answer) {
+            return null;
+          }
 
-        return {
-          question,
-          answer,
-          sortOrder: index,
-          difficulty: normalizeText(card.difficulty),
-        };
-      })
-      .filter(Boolean) as Array<GeneratedFlashcard & { difficulty?: string }>;
+          if (
+            !isFlashcardGrounded({
+              question,
+              answer,
+              title: input.title,
+              materialTokens,
+            })
+          ) {
+            return null;
+          }
 
-    return flashcards?.length ? flashcards : null;
+          return {
+            question,
+            answer,
+            sortOrder: index,
+            difficulty: normalizeText(card.difficulty),
+          };
+        })
+        .filter(Boolean) as Array<GeneratedFlashcard & { difficulty?: string }>;
+
+      // Return if we got a decent set (4+ cards)
+      if (flashcards?.length && flashcards.length >= 4) {
+        return flashcards;
+      }
+    }
+
+    // Exhausted retries
+    return null;
   },
 
   async createFeynmanStarter(input: {
     topic: string;
     extractedText: string | null;
   }) {
-    const payload = await createChatCompletion([
-      {
-        role: "system",
-        content:
-          "You are a Feynman study coach. Ask one short opening question that gets the student to explain the actual content of the uploaded document in simple language. Ignore generic chapter names, filenames, and labels like UNIT3DBMS. Do not ask what the title means. Do not speculate from the title. Ask about the ideas present in the reference material only.",
-      },
-      {
-        role: "user",
-        content: [
-          `Content cue from the document: ${input.topic}`,
-          `Study material:\n${limitContext(input.extractedText, 5000) || "No extracted text available."}`,
-        ].join("\n\n"),
-      },
-    ]);
+    const payload = await createChatCompletion(
+      [
+        {
+          role: "system",
+          content:
+            "You are a strict Feynman study coach. Ask exactly one focused opening question grounded in the reference material only. Avoid generic prompts. Do not ask about title meaning, chapter labels, or filenames. If the material is code, ask about program flow, key functions, data structures, or edge cases. Keep the question concise and clear.",
+        },
+        {
+          role: "user",
+          content: [
+            `Content cue from the document: ${input.topic}`,
+            `Study material:\n${limitContext(input.extractedText, 5000) || "No extracted text available."}`,
+            "Question quality rules: specific, concept-driven, and answerable from the provided material.",
+          ].join("\n\n"),
+        },
+      ],
+      undefined,
+      { maxTokens: 500, temperature: 0.35 },
+    );
 
     return readChoiceContent(payload);
   },
@@ -346,24 +523,29 @@ export const localAiService = {
       .map((message) => `${message.role}: ${message.content}`)
       .join("\n");
 
-    const payload = await createChatCompletion([
-      {
-        role: "system",
-        content:
-          "You are a strict Feynman study coach. Ask one focused follow-up question that targets misunderstandings, missing causal links, vague wording, or missing examples in the uploaded document content. Ignore generic chapter names, filenames, and labels like UNIT3DBMS. Never ask what the title means or infer concepts from the title alone. If the student has covered enough and completion is near 100, reply with one short sentence telling them to complete the session for evaluation.",
-      },
-      {
-        role: "user",
-        content: [
-          `Content cue from the document: ${input.topic}`,
-          `Completion percent: ${input.completionPercent}`,
-          `Reference material:\n${limitContext(input.extractedText, 3500) || "No extracted text available."}`,
-          `Running session summary:\n${limitContext(input.sessionSummary, 1800) || "No prior summary yet."}`,
-          `Recent conversation:\n${transcript || "No prior conversation."}`,
-          `Latest student explanation:\n${limitContext(input.explanation, 2500)}`,
-        ].join("\n\n"),
-      },
-    ]);
+    const payload = await createChatCompletion(
+      [
+        {
+          role: "system",
+          content:
+            "You are a strict Feynman study coach. Ask exactly one focused follow-up question that targets a concrete gap: misconception, missing step, weak reasoning, or absent example. Ground every question in the provided reference material only. If material is code, ask about control flow, function responsibilities, complexity, edge cases, or correctness. Never ask generic questions. If completion is near 100 and understanding is solid, respond with one short sentence telling the student to complete the session for evaluation.",
+        },
+        {
+          role: "user",
+          content: [
+            `Content cue from the document: ${input.topic}`,
+            `Completion percent: ${input.completionPercent}`,
+            `Reference material:\n${limitContext(input.extractedText, 3500) || "No extracted text available."}`,
+            `Running session summary:\n${limitContext(input.sessionSummary, 1800) || "No prior summary yet."}`,
+            `Recent conversation:\n${transcript || "No prior conversation."}`,
+            `Latest student explanation:\n${limitContext(input.explanation, 2500)}`,
+            "Question quality rules: specific, test understanding deeply, and avoid repeating earlier prompts.",
+          ].join("\n\n"),
+        },
+      ],
+      undefined,
+      { maxTokens: 650, temperature: 0.35 },
+    );
 
     return readChoiceContent(payload);
   },

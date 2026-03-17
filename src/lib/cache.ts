@@ -59,3 +59,11 @@ export function writeSessionCache<T>(key: string, value: T) {
 
   window.sessionStorage.setItem(key, JSON.stringify(payload));
 }
+
+export function removeSessionCache(key: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.sessionStorage.removeItem(key);
+}

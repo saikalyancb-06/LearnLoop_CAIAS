@@ -4,6 +4,7 @@ import { Link, useNavigate } from "react-router";
 import { useAuth } from "../../hooks/useAuth";
 import { dashboardService } from "../../services/dashboardService";
 import { documentsService } from "../../services/documentsService";
+import { getDocumentTypeLabel } from "../../lib/documentDisplay";
 import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../../lib/cache";
 
 export function Dashboard() {
@@ -22,13 +23,15 @@ export function Dashboard() {
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function loadDashboard() {
+  async function loadDashboard(options?: { silent?: boolean }) {
     if (!user) {
       return;
     }
 
-    setIsLoading(true);
-    setError(null);
+    if (!options?.silent) {
+      setIsLoading(true);
+      setError(null);
+    }
 
     try {
       const data = await dashboardService.getDashboardData(user.id);
@@ -39,19 +42,25 @@ export function Dashboard() {
       writeSessionCache("dashboard.sessions", data.recentSessions);
       writeSessionCache("dashboard.summary", data.summary);
     } catch (dashboardError) {
-      setError(
-        dashboardError instanceof Error
-          ? dashboardError.message
-          : "Unable to load your dashboard.",
-      );
+      if (!options?.silent) {
+        setError(
+          dashboardError instanceof Error
+            ? dashboardError.message
+            : "Unable to load your dashboard.",
+        );
+      }
     } finally {
       setIsLoading(false);
     }
   }
 
   useEffect(() => {
-    if (readSessionCache("dashboard.documents") && isSessionCacheFresh("dashboard.documents", 1000 * 60 * 3)) {
+    if (
+      readSessionCache("dashboard.documents") &&
+      isSessionCacheFresh("dashboard.documents", 1000 * 60 * 3)
+    ) {
       setIsLoading(false);
+      void loadDashboard({ silent: true });
       return;
     }
 
@@ -232,7 +241,9 @@ export function Dashboard() {
                     <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
                       <FileText className="w-5 h-5 text-gray-600" />
                     </div>
-                    <span className="text-xs text-gray-500 uppercase">{note.mime_type.split("/").pop()}</span>
+                    <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-indigo-700">
+                      {getDocumentTypeLabel(note.mime_type, note.original_filename)}
+                    </span>
                   </div>
                   <h3 className="font-medium text-gray-900 mb-2 line-clamp-2">{note.title}</h3>
                   <div className="flex items-center justify-between text-sm mb-3">

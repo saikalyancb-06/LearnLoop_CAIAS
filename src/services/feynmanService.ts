@@ -2,28 +2,87 @@ import { supabase } from "../lib/supabaseClient";
 import { progressService } from "./progressService";
 import { localAiService } from "./localAiService";
 
+function normalizeWhitespace(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
 function splitIntoSentences(text: string) {
-  return text
-    .split(/[.!?]/)
+  return normalizeWhitespace(text)
+    .split(/(?<=[.!?])\s+/)
     .map((sentence) => sentence.trim())
     .filter(Boolean);
 }
 
-function buildQuestions(topic: string, extractedText: string | null) {
-  const sentences = splitIntoSentences(extractedText ?? "").slice(0, 3);
+function isCodeLikeText(text: string) {
+  const value = normalizeWhitespace(text);
 
-  if (sentences.length === 0) {
+  if (!value) {
+    return false;
+  }
+
+  const hintCount = [
+    /#include/i,
+    /\b(int|void|return|struct|class|switch|case|printf|scanf|malloc|free)\b/i,
+    /\{/, /\}/,
+    /;\s*/,
+    /\bmain\s*\(/i,
+  ].filter((pattern) => pattern.test(value)).length;
+
+  return hintCount >= 3;
+}
+
+function truncateSentence(value: string, maxLength = 170) {
+  const normalized = normalizeWhitespace(value);
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength).trimEnd()}...`;
+}
+
+function extractMeaningfulCue(text: string) {
+  const sentences = splitIntoSentences(text);
+
+  const candidate =
+    sentences.find((sentence) => sentence.split(/\s+/).length >= 7 && !isCodeLikeText(sentence)) ??
+    sentences.find((sentence) => sentence.split(/\s+/).length >= 5) ??
+    sentences[0] ??
+    "";
+
+  return truncateSentence(candidate);
+}
+
+function buildQuestions(topic: string, extractedText: string | null) {
+  const normalizedTopic = truncateSentence(topic, 120) || "this document";
+  const normalizedText = normalizeWhitespace(extractedText ?? "");
+
+  if (!normalizedText) {
     return [
-      "Can you explain the main idea from this uploaded document like I am a beginner?",
-      "What real-world example from the document would help teach this better?",
-      "What part of the document still feels unclear or incomplete in your explanation?",
+      `Explain the core idea of ${normalizedTopic} like you're teaching a beginner.`,
+      "Give one concrete example that proves your explanation is correct.",
+      "Which part still feels unclear, and how would you clarify it step by step?",
     ];
   }
 
+  if (isCodeLikeText(normalizedText)) {
+    return [
+      `Walk me through the logic of ${normalizedTopic} from input to output in simple steps.`,
+      "Which function or code block is most important, and why does it matter?",
+      "Where can this code fail or break, and what improvement would you make first?",
+    ];
+  }
+
+  const cue = extractMeaningfulCue(normalizedText) || normalizedTopic;
+
   return [
-    `Start by explaining this idea from the document in simple language: ${sentences[0]}`,
-    "What important point from the document did you leave out, and how would you add it now?",
-    "Give one concrete example from the document and explain why it matters.",
+    `Teach this idea from the document in simple language: ${cue}`,
+    "What specific detail from the document supports your explanation best?",
+    "What important point is still missing, and how would you improve your explanation?",
   ];
 }
 
@@ -75,6 +134,108 @@ function buildFallbackSessionSummary(input: {
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+const LOW_SIGNAL_TOKENS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "that",
+  "this",
+  "from",
+  "into",
+  "your",
+  "have",
+  "will",
+  "about",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "these",
+  "those",
+  "then",
+  "than",
+  "them",
+  "they",
+  "their",
+  "there",
+  "document",
+  "topic",
+  "concept",
+  "main",
+  "idea",
+  "explain",
+  "teach",
+]);
+
+function tokenizeContent(value: string) {
+  return normalizeWhitespace(value)
+    .toLowerCase()
+    .match(/[a-z0-9]{3,}/g)
+    ?.filter((token) => !LOW_SIGNAL_TOKENS.has(token)) ?? [];
+}
+
+function isGenericFeynmanPrompt(prompt: string) {
+  const normalized = normalizeWhitespace(prompt).toLowerCase();
+
+  return [
+    /^can you explain/i,
+    /^what is the main idea/i,
+    /^tell me more/i,
+    /^explain this/i,
+    /^what does the title mean/i,
+    /^summarize/i,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+function isFeynmanPromptGrounded(input: {
+  prompt: string;
+  topic: string;
+  extractedText: string | null;
+  completionPercent?: number;
+}) {
+  const prompt = normalizeWhitespace(input.prompt);
+
+  if (!prompt || prompt.length < 16) {
+    return false;
+  }
+
+  if (
+    (input.completionPercent ?? 0) >= 95 &&
+    /complete\s+the\s+session|see\s+your\s+evaluation/i.test(prompt)
+  ) {
+    return true;
+  }
+
+  if (isGenericFeynmanPrompt(prompt)) {
+    return false;
+  }
+
+  const promptTokens = tokenizeContent(prompt);
+
+  if (!promptTokens.length) {
+    return false;
+  }
+
+  const materialTokens = new Set(tokenizeContent(input.extractedText ?? ""));
+
+  if (!materialTokens.size) {
+    return prompt.length > 24;
+  }
+
+  const overlap = promptTokens.filter((token) => materialTokens.has(token)).length;
+
+  if (overlap >= 2) {
+    return true;
+  }
+
+  const topicTokens = new Set(tokenizeContent(input.topic));
+  const topicOverlap = promptTokens.filter((token) => topicTokens.has(token)).length;
+
+  return overlap >= 1 && topicOverlap >= 1;
 }
 
 export const feynmanService = {
@@ -213,11 +374,18 @@ export const feynmanService = {
           })
           .catch(() => "")
       : "";
+    const groundedStarter = isFeynmanPromptGrounded({
+      prompt: aiStarter,
+      topic: input.topic,
+      extractedText: input.extractedText,
+    })
+      ? aiStarter
+      : "";
 
     const { error } = await supabase.from("feynman_messages").insert({
       session_id: input.sessionId,
       role: "ai",
-      content: aiStarter || starterQuestions[0],
+      content: groundedStarter || starterQuestions[0],
     });
 
     if (error) {
@@ -299,12 +467,20 @@ export const feynmanService = {
           })
           .catch(() => "")
       : "";
+    const groundedFollowUp = isFeynmanPromptGrounded({
+      prompt: aiFollowUp,
+      topic: input.topic,
+      extractedText: input.extractedText,
+      completionPercent,
+    })
+      ? aiFollowUp
+      : "";
 
     const { error: aiError } = await supabase.from("feynman_messages").insert({
       session_id: input.sessionId,
       role: "ai",
       content:
-        aiFollowUp ||
+        groundedFollowUp ||
         (completionPercent >= 100
           ? "You have explained the main ideas. Complete the session to see your evaluation."
           : nextQuestion),

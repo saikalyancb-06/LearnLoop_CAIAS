@@ -14,20 +14,245 @@ type SessionSummary = {
   overall_score: number | null;
 };
 
-function deriveFeynmanTopic(document: any) {
-  const summary = typeof document?.metadata?.summary === "string" ? document.metadata.summary.trim() : "";
-  const extractedText = typeof document?.extracted_text === "string" ? document.extracted_text.trim() : "";
-  const firstSentence =
-    summary.split(/(?<=[.!?])\s+/).find(Boolean) ??
-    extractedText.split(/(?<=[.!?])\s+/).find(Boolean) ??
-    "";
-  const normalized = firstSentence.replace(/\s+/g, " ").trim();
+type MessagePart =
+  | { type: "text"; content: string }
+  | { type: "code"; content: string; language: string };
 
-  if (!normalized) {
-    return "Core ideas from the uploaded document";
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: any) => void) | null;
+  onerror: ((event: any) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+function normalizeWhitespace(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function isCodeLikeText(value: string) {
+  const text = normalizeWhitespace(value);
+
+  if (!text) {
+    return false;
   }
 
-  return normalized.slice(0, 140);
+  const hintCount = [
+    /#include|#define/i,
+    /\b(int|void|return|struct|class|switch|case|printf|scanf|malloc|free)\b/i,
+    /\bmain\s*\(/i,
+    /\{/, /\}/,
+    /;\s*/,
+  ].filter((pattern) => pattern.test(text)).length;
+
+  return hintCount >= 3;
+}
+
+function looksLikeFlattenedCode(content: string) {
+  const lineCount = content.split("\n").length;
+  const semicolonCount = (content.match(/;/g) ?? []).length;
+  return isCodeLikeText(content) && lineCount <= 2 && semicolonCount >= 3;
+}
+
+function inferCodeLanguage(content: string) {
+  if (/#include|printf|scanf|malloc|\bstruct\b/i.test(content)) {
+    return "c";
+  }
+
+  if (/\b(const|let|function|return)\b|=>/.test(content)) {
+    return "javascript";
+  }
+
+  return "text";
+}
+
+function formatFlattenedCode(content: string) {
+  const withBreaks = content
+    .replace(/\{/g, "{\n")
+    .replace(/\}/g, "\n}\n")
+    .replace(/;\s*/g, ";\n")
+    .replace(/\n{3,}/g, "\n\n");
+
+  let indentLevel = 0;
+
+  return withBreaks
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      if (line.startsWith("}")) {
+        indentLevel = Math.max(0, indentLevel - 1);
+      }
+
+      const output = `${"  ".repeat(indentLevel)}${line}`;
+
+      if (line.endsWith("{")) {
+        indentLevel += 1;
+      }
+
+      return output;
+    })
+    .join("\n");
+}
+
+function parseMessageParts(content: string): MessagePart[] {
+  const codeBlockPattern = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+  const matches = [...content.matchAll(codeBlockPattern)];
+
+  if (matches.length === 0) {
+    if (looksLikeFlattenedCode(content)) {
+      return [
+        {
+          type: "code",
+          content: formatFlattenedCode(content),
+          language: inferCodeLanguage(content),
+        },
+      ];
+    }
+
+    return [{ type: "text", content }];
+  }
+
+  const parts: MessagePart[] = [];
+  let cursor = 0;
+
+  for (const match of matches) {
+    const matchIndex = match.index ?? 0;
+    const textBefore = content.slice(cursor, matchIndex);
+
+    if (textBefore.trim()) {
+      parts.push({ type: "text", content: textBefore.trim() });
+    }
+
+    parts.push({
+      type: "code",
+      language: (match[1] ?? "text").trim() || "text",
+      content: (match[2] ?? "").replace(/\n+$/, ""),
+    });
+
+    cursor = matchIndex + match[0].length;
+  }
+
+  const trailing = content.slice(cursor);
+
+  if (trailing.trim()) {
+    parts.push({ type: "text", content: trailing.trim() });
+  }
+
+  return parts.length > 0 ? parts : [{ type: "text", content }];
+}
+
+function extractCodeTargets(text: string) {
+  const candidates =
+    text.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\s*\(/g)?.map((match) => match.replace(/\($/, "").trim()) ?? [];
+
+  const blacklist = new Set([
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "sizeof",
+    "main",
+  ]);
+
+  return [...new Set(candidates.map((value) => value.toLowerCase()))]
+    .filter((name) => !blacklist.has(name))
+    .slice(0, 3);
+}
+
+function toDisplayTopic(value: string) {
+  const normalized = normalizeWhitespace(value);
+
+  if (!normalized) {
+    return "Study Topic";
+  }
+
+  if (looksLikeFlattenedCode(normalized)) {
+    return formatFlattenedCode(normalized).split("\n").slice(0, 8).join("\n");
+  }
+
+  return normalized.length > 170 ? `${normalized.slice(0, 170).trimEnd()}...` : normalized;
+}
+
+function toSessionLabel(value: string) {
+  const normalized = normalizeWhitespace(value);
+
+  if (!normalized) {
+    return "Untitled session";
+  }
+
+  if (isCodeLikeText(normalized)) {
+    return "Code walkthrough session";
+  }
+
+  return normalized.length > 90 ? `${normalized.slice(0, 90).trimEnd()}...` : normalized;
+}
+
+function getSpeechRecognitionCtor() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const scope = window as Window & {
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  };
+
+  return scope.SpeechRecognition ?? scope.webkitSpeechRecognition ?? null;
+}
+
+function formatDuration(seconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainder = safeSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function deriveFeynmanTopic(document: any) {
+  const title = typeof document?.title === "string" ? normalizeWhitespace(document.title) : "uploaded document";
+  const summary =
+    typeof document?.metadata?.summary === "string" ? normalizeWhitespace(document.metadata.summary) : "";
+  const extractedText =
+    typeof document?.extracted_text === "string" ? normalizeWhitespace(document.extracted_text) : "";
+  const conceptLabels = Array.isArray(document?.metadata?.concepts)
+    ? document.metadata.concepts
+        .map((concept: any) => (typeof concept?.label === "string" ? normalizeWhitespace(concept.label) : ""))
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
+
+  if (isCodeLikeText(summary) || isCodeLikeText(extractedText)) {
+    const targets = extractCodeTargets(extractedText || summary);
+
+    if (targets.length > 0) {
+      return `Explain how ${targets.join(", ")} work together in ${title}`;
+    }
+
+    return `Explain the core logic and control flow in ${title}`;
+  }
+
+  const firstSummarySentence = summary.split(/(?<=[.!?])\s+/).find(Boolean) ?? "";
+
+  if (firstSummarySentence && !isCodeLikeText(firstSummarySentence)) {
+    return toDisplayTopic(firstSummarySentence);
+  }
+
+  if (conceptLabels.length > 0) {
+    return `Teach these key ideas from ${title}: ${conceptLabels.join(", ")}`;
+  }
+
+  const extractedSentence = extractedText.split(/(?<=[.!?])\s+/).find(Boolean) ?? "";
+
+  if (extractedSentence && !isCodeLikeText(extractedSentence)) {
+    return toDisplayTopic(extractedSentence);
+  }
+
+  return `Core ideas from ${title}`;
 }
 
 export function FeynmanMode() {
@@ -46,8 +271,13 @@ export function FeynmanMode() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isVoiceSupported, setIsVoiceSupported] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const recordingStartedAtRef = useRef<number | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const isViewingHistory = Boolean(selectedHistorySession);
   const visibleSession = selectedHistorySession ?? currentSession;
@@ -122,10 +352,45 @@ export function FeynmanMode() {
     });
   }, [visibleConversation, isViewingHistory]);
 
+  useEffect(() => {
+    setIsVoiceSupported(Boolean(getSpeechRecognitionCtor()));
+
+    return () => {
+      stopRequestedRef.current = true;
+      recognitionRef.current?.abort();
+      recognitionRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isRecording) {
+      return;
+    }
+
+    const updateElapsed = () => {
+      if (!recordingStartedAtRef.current) {
+        return;
+      }
+
+      setRecordingSeconds(
+        Math.floor((Date.now() - recordingStartedAtRef.current) / 1000),
+      );
+    };
+
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isRecording]);
+
   const currentTopic = useMemo(
     () => visibleSession?.topic ?? document?.title ?? "Study Topic",
     [document, visibleSession],
   );
+  const topicLooksLikeCode = useMemo(() => isCodeLikeText(currentTopic), [currentTopic]);
+  const displayTopic = useMemo(() => toDisplayTopic(currentTopic), [currentTopic]);
   const progressPercent = visibleSession?.completion_percent ?? 0;
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -215,7 +480,85 @@ export function FeynmanMode() {
   };
 
   const toggleRecording = () => {
-    setIsRecording((currentValue) => !currentValue);
+    if (isRecording) {
+      stopRequestedRef.current = true;
+      recognitionRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+
+    const SpeechRecognitionCtor = getSpeechRecognitionCtor();
+
+    if (!SpeechRecognitionCtor) {
+      setError("Voice explanation is not supported in this browser. Use Chrome or Edge.");
+      return;
+    }
+
+    if (!recognitionRef.current) {
+      const recognition = new SpeechRecognitionCtor();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event: any) => {
+        let finalText = "";
+
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const transcript = result?.[0]?.transcript ?? "";
+
+          if (result?.isFinal) {
+            finalText += transcript;
+          }
+        }
+
+        if (finalText.trim()) {
+          setUserInput((currentValue) => {
+            const prefix = currentValue && !currentValue.endsWith(" ") ? " " : "";
+            return `${currentValue}${prefix}${finalText.trim()}`.trimStart();
+          });
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        const code = String(event?.error ?? "");
+
+        if (code === "not-allowed" || code === "service-not-allowed") {
+          setError("Microphone permission is blocked. Please allow microphone access and try again.");
+        } else if (code === "no-speech") {
+          setError("No speech detected. Try speaking clearly and a little closer to the microphone.");
+        } else {
+          setError("Voice explanation failed. Please try again.");
+        }
+
+        setIsRecording(false);
+        recordingStartedAtRef.current = null;
+        setRecordingSeconds(0);
+      };
+
+      recognition.onend = () => {
+        setIsRecording(false);
+        stopRequestedRef.current = false;
+        recordingStartedAtRef.current = null;
+        setRecordingSeconds(0);
+      };
+
+      recognitionRef.current = recognition;
+    }
+
+    try {
+      setError(null);
+      stopRequestedRef.current = false;
+      recordingStartedAtRef.current = Date.now();
+      setRecordingSeconds(0);
+      recognitionRef.current.start();
+      setIsRecording(true);
+    } catch {
+      setIsRecording(false);
+      recordingStartedAtRef.current = null;
+      setRecordingSeconds(0);
+      setError("Unable to start voice explanation. Please try again.");
+    }
   };
 
   if (isLoading) {
@@ -276,7 +619,18 @@ export function FeynmanMode() {
                   <div className="text-sm text-gray-500 mb-1">
                     {isViewingHistory ? "Session Topic" : "Current Topic"}
                   </div>
-                  <div className="text-2xl font-semibold text-gray-900">{currentTopic}</div>
+                  {topicLooksLikeCode ? (
+                    <div className="mt-2 overflow-hidden rounded-lg border border-slate-700 bg-slate-950">
+                      <div className="border-b border-slate-700 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                        code focus
+                      </div>
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs leading-5 text-slate-100">
+                        <code>{displayTopic}</code>
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="text-2xl font-semibold text-gray-900">{displayTopic}</div>
+                  )}
                 </div>
                 <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center">
                   <span className="text-2xl">🧠</span>
@@ -319,7 +673,28 @@ export function FeynmanMode() {
                             : "bg-gray-50 border border-gray-200 text-gray-900"
                         }`}
                       >
-                        <p className="text-sm leading-relaxed">{message.content}</p>
+                        {parseMessageParts(message.content).map((part, index) =>
+                          part.type === "code" ? (
+                            <div
+                              key={`${message.id}-code-${index}`}
+                              className="my-2 overflow-x-auto rounded-md border border-slate-700 bg-slate-950"
+                            >
+                              <div className="border-b border-slate-700 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                                {part.language}
+                              </div>
+                              <pre className="p-3 text-xs leading-6 text-slate-100">
+                                <code>{part.content}</code>
+                              </pre>
+                            </div>
+                          ) : (
+                            <p
+                              key={`${message.id}-text-${index}`}
+                              className="whitespace-pre-wrap break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
+                            >
+                              {part.content}
+                            </p>
+                          ),
+                        )}
                       </div>
                       {message.role === "user" && (
                         <div className="w-8 h-8 bg-gray-200 rounded-full flex items-center justify-center flex-shrink-0">
@@ -363,6 +738,7 @@ export function FeynmanMode() {
                       <button
                         type="button"
                         onClick={toggleRecording}
+                        disabled={!isVoiceSupported}
                         className={`flex items-center gap-2 px-4 py-2 border rounded-lg transition-colors ${
                           isRecording
                             ? "border-red-300 bg-red-50 text-red-700"
@@ -370,7 +746,13 @@ export function FeynmanMode() {
                         }`}
                       >
                         <Mic className="w-4 h-4" />
-                        <span>Voice Explanation</span>
+                        <span>
+                          {!isVoiceSupported
+                            ? "Voice Unavailable"
+                            : isRecording
+                              ? "Stop Recording"
+                              : "Voice Explanation"}
+                        </span>
                       </button>
 
                       <button
@@ -380,6 +762,22 @@ export function FeynmanMode() {
                       >
                         {isSubmitting ? "Sending..." : "Send Explanation"}
                       </button>
+                    </div>
+
+                    {isRecording ? (
+                      <div className="inline-flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">
+                        <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse"></span>
+                        Recording
+                        <span className="font-mono">{formatDuration(recordingSeconds)}</span>
+                      </div>
+                    ) : null}
+
+                    <div className="text-xs text-gray-500">
+                      {isVoiceSupported
+                        ? isRecording
+                          ? "Listening... speak naturally and your words will be added to the explanation box."
+                          : "Tip: click Voice Explanation to dictate your response."
+                        : "Voice input requires a browser with Speech Recognition support (Chrome/Edge)."}
                     </div>
                   </form>
                 )}
@@ -417,7 +815,7 @@ export function FeynmanMode() {
                         : "border-gray-200 hover:border-indigo-200 hover:bg-gray-50"
                     }`}
                   >
-                    <div className="text-sm font-medium text-gray-900 truncate">{historySession.topic}</div>
+                    <div className="text-sm font-medium text-gray-900 truncate">{toSessionLabel(historySession.topic)}</div>
                     <div className="mt-1 text-xs text-gray-500">
                       {new Date(historySession.created_at).toLocaleString()}
                     </div>
