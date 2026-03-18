@@ -121,6 +121,80 @@ function parseMessageParts(content: string): MessagePart[] {
   return parts.length ? parts : [{ type: "text", content }];
 }
 
+function truncateText(value: string, maxLength = 500) {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, maxLength).trimEnd()}...`;
+}
+
+function formatDenseStudyText(content: string, maxLength?: number) {
+  const normalized = content
+    .replace(/\u00a0/g, " ")
+    .replace(/[□■▪▫◦•]/g, " • ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  let formatted = normalized
+    .replace(/^\d+\s+(?=chapter\b)/i, "")
+    .replace(/\s*•\s*/g, "\n• ")
+    .replace(/\s+(?=\d+[.)]\s+)/g, "\n")
+    .replace(/([.!?])\s+(?=[A-Z][a-z])/g, "$1\n");
+
+  const objectiveCount = (formatted.match(/\bTo\s+[a-z]/g) ?? []).length;
+
+  if (objectiveCount >= 3 && !formatted.includes("\n• To")) {
+    const chunks = formatted
+      .split(/\s+(?=To\s+[a-z])/g)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+
+    if (chunks.length > 1) {
+      const [lead, ...rest] = chunks;
+      formatted = [lead, ...rest.map((chunk) => `• ${chunk}`)].join("\n");
+    }
+  }
+
+  formatted = formatted.replace(/\n{3,}/g, "\n\n").trim();
+
+  if (typeof maxLength === "number") {
+    return truncateText(formatted, maxLength);
+  }
+
+  return formatted;
+}
+
+function buildInitialCopilotMessage(input: {
+  title: string;
+  summary: string | null | undefined;
+  extractedText: string | null;
+}) {
+  const cleanedSummary = formatDenseStudyText(input.summary ?? "", 480);
+
+  if (cleanedSummary) {
+    return cleanedSummary;
+  }
+
+  const firstChunk =
+    input.extractedText
+      ?.split(/\n{2,}/)
+      .map((chunk) => chunk.trim())
+      .find((chunk) => chunk.length > 40) ??
+    "";
+  const cleanedChunk = formatDenseStudyText(firstChunk, 420);
+
+  if (cleanedChunk) {
+    return `I analyzed ${input.title}. Here is a clean summary:\n${cleanedChunk}`;
+  }
+
+  return `I analyzed ${input.title}. Ask me anything about the key ideas.`;
+}
+
 function buildCopilotReply(question: string, documentTitle: string, extractedText: string | null) {
   const summary = extractedText?.split("\n").slice(0, 2).join(" ") ?? "";
   const normalizedQuestion = question.toLowerCase();
@@ -194,9 +268,11 @@ export function DocumentWorkspace() {
               {
                 id: "1",
                 role: "ai",
-                content:
-                  (nextDocument.metadata?.summary as string | undefined) ??
-                  `I analyzed ${nextDocument.title}. Ask me anything about the key ideas.`,
+                content: buildInitialCopilotMessage({
+                  title: nextDocument.title,
+                  summary: nextDocument.metadata?.summary as string | undefined,
+                  extractedText: nextDocument.extracted_text,
+                }),
               },
             ],
       );
@@ -449,7 +525,7 @@ export function DocumentWorkspace() {
                         key={`${message.id}-text-${index}`}
                         className="whitespace-pre-wrap break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
                       >
-                        {part.content}
+                        {message.role === "ai" ? formatDenseStudyText(part.content) : part.content}
                       </p>
                     ),
                   )}
