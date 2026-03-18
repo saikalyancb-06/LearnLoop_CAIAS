@@ -27,6 +27,23 @@ type FeynmanEvaluation = {
   improvementPoints: string[];
   misconceptions: string[];
   summary: string;
+  knowledgeRating: string;
+};
+
+type FeynmanQuestionPlan = {
+  estimatedQuestionCount: number;
+  rationale: string;
+};
+
+type FeynmanTurnReview = {
+  verdict: "correct" | "partially_correct" | "incorrect";
+  score: number;
+  strengths: string[];
+  missingPoints: string[];
+  incorrectPoints: string[];
+  feedback: string;
+  shouldAskFollowUp: boolean;
+  nextQuestion: string;
 };
 
 function clampScore(value: unknown) {
@@ -156,6 +173,40 @@ function trimList(value: unknown, limit = 4) {
     : [];
 }
 
+function clampQuestionCount(value: unknown) {
+  const numeric = typeof value === "number" ? value : Number(value);
+
+  if (!Number.isFinite(numeric)) {
+    return 8;
+  }
+
+  return Math.max(5, Math.min(20, Math.round(numeric)));
+}
+
+function normalizeVerdict(value: unknown): FeynmanTurnReview["verdict"] {
+  const normalized = normalizeText(value).toLowerCase();
+
+  if (normalized === "correct" || normalized === "partially_correct" || normalized === "incorrect") {
+    return normalized;
+  }
+
+  return "partially_correct";
+}
+
+function normalizeTurnScore(verdict: FeynmanTurnReview["verdict"], value: unknown) {
+  const rawScore = clampScore(value);
+
+  if (verdict === "correct") {
+    return Math.max(75, rawScore);
+  }
+
+  if (verdict === "partially_correct") {
+    return Math.max(45, rawScore);
+  }
+
+  return Math.min(rawScore, 35);
+}
+
 function tokenize(value: string) {
   return normalizeText(value)
     .toLowerCase()
@@ -213,6 +264,28 @@ function normalizeQuestion(value: unknown) {
   }
 
   return `${normalized}?`;
+}
+
+function isUnsureAnswer(value: string) {
+  const normalized = normalizeText(value).toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "dont know",
+    "don't know",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "no idea",
+    "not sure",
+    "unsure",
+    "dunno",
+    "i really dont know",
+    "i really don't know",
+  ].some((token) => normalized.includes(token));
 }
 
 function isGenericFlashcardQuestion(question: string) {
@@ -550,6 +623,118 @@ export const localAiService = {
     return readChoiceContent(payload);
   },
 
+  async estimateFeynmanQuestionCount(input: {
+    topic: string;
+    extractedText: string | null;
+  }) {
+    const payload = await createChatCompletion(
+      [
+        {
+          role: "system",
+          content:
+            "You plan a short oral teaching assessment. Return valid JSON only with this schema: {\"estimated_question_count\":8,\"rationale\":\"string\"}. Choose an integer from 5 to 20 based on topic complexity, density, ambiguity, and likely misconceptions. Prefer fewer questions for narrow topics and more for dense or multi-step topics.",
+        },
+        {
+          role: "user",
+          content: [
+            `Topic:\n${input.topic}`,
+            `Reference material:\n${limitContext(input.extractedText, 5000) || "No extracted text available."}`,
+          ].join("\n\n"),
+        },
+      ],
+      { type: "json_object" },
+      { maxTokens: 400, temperature: 0.2 },
+    );
+
+    const parsed = extractJson<{ estimated_question_count?: unknown; rationale?: unknown }>(
+      readChoiceContent(payload),
+    );
+
+    if (!parsed) {
+      return null;
+    }
+
+    return {
+      estimatedQuestionCount: clampQuestionCount(parsed.estimated_question_count),
+      rationale: normalizeText(parsed.rationale),
+    } satisfies FeynmanQuestionPlan;
+  },
+
+  async reviewFeynmanTurn(input: {
+    topic: string;
+    extractedText: string | null;
+    sessionSummary: string | null;
+    conversation: Array<{ role: string; content: string }>;
+    explanation: string;
+    questionCount: number;
+    targetQuestionCount: number;
+  }) {
+    const transcript = input.conversation
+      .slice(-8)
+      .map((message) => `${message.role}: ${message.content}`)
+      .join("\n");
+
+    const payload = await createChatCompletion(
+      [
+        {
+          role: "system",
+          content:
+            "You are a strict but fair Feynman tutor evaluating one student answer at a time. Return valid JSON only with this schema: {\"verdict\":\"correct|partially_correct|incorrect\",\"score\":0,\"strengths\":[\"string\"],\"missing_points\":[\"string\"],\"incorrect_points\":[\"string\"],\"feedback\":\"string\",\"should_ask_follow_up\":true,\"next_question\":\"string\"}. Critical grading rules: 1. Mark an answer incorrect only if it directly contradicts the reference material. 2. If the answer is short, partial, or incomplete but not contradictory, mark it partially_correct, not incorrect. 3. If the student says they do not know, mark incorrect and ask a simpler, more guided next question instead of repeating the same wording. 4. In incorrect_points, mention only true contradictions, not missing details. 5. In missing_points, list omitted required ideas. 6. Score concise but directionally correct answers in a reasonable partial-credit range, not near zero.",
+        },
+        {
+          role: "user",
+          content: [
+            `Content cue from the document: ${input.topic}`,
+            `Answered questions so far: ${input.questionCount} / ${input.targetQuestionCount}`,
+            `Reference material:\n${limitContext(input.extractedText, 4500) || "No extracted text available."}`,
+            `Running session summary:\n${limitContext(input.sessionSummary, 1800) || "No prior summary yet."}`,
+            `Recent conversation:\n${transcript || "No prior conversation."}`,
+            `Latest student explanation:\n${limitContext(input.explanation, 2200)}`,
+            isUnsureAnswer(input.explanation)
+              ? "The latest student answer is an explicit 'I don't know' style response. Do not repeat the previous question wording. Ask a simpler guided next question."
+              : "The latest student answer may be partial. If it is directionally correct, award partial credit rather than marking it wrong.",
+          ].join("\n\n"),
+        },
+      ],
+      { type: "json_object" },
+      { maxTokens: 900, temperature: 0.25 },
+    );
+
+    const parsed = extractJson<{
+      verdict?: unknown;
+      score?: unknown;
+      strengths?: unknown;
+      missing_points?: unknown;
+      incorrect_points?: unknown;
+      feedback?: unknown;
+      should_ask_follow_up?: unknown;
+      next_question?: unknown;
+    }>(readChoiceContent(payload));
+
+    if (!parsed) {
+      return null;
+    }
+
+    const verdict = normalizeVerdict(parsed.verdict);
+
+    const review: FeynmanTurnReview = {
+      verdict,
+      score: normalizeTurnScore(verdict, parsed.score),
+      strengths: trimList(parsed.strengths, 4),
+      missingPoints: trimList(parsed.missing_points, 4),
+      incorrectPoints: trimList(parsed.incorrect_points, 4),
+      feedback: normalizeText(parsed.feedback),
+      shouldAskFollowUp: Boolean(parsed.should_ask_follow_up),
+      nextQuestion: normalizeQuestion(parsed.next_question),
+    };
+
+    if (!review.feedback || !review.nextQuestion) {
+      return null;
+    }
+
+    return review;
+  },
+
   async evaluateFeynman(input: {
     topic: string;
     extractedText: string | null;
@@ -611,6 +796,14 @@ export const localAiService = {
       misconceptions,
       improvementPoints,
       summary: normalizeText(parsed.summary),
+      knowledgeRating:
+        clampScore(parsed.overall_score) >= 85
+          ? "Advanced"
+          : clampScore(parsed.overall_score) >= 70
+            ? "Proficient"
+            : clampScore(parsed.overall_score) >= 50
+              ? "Developing"
+              : "Foundational",
     };
 
     if (!evaluation.summary) {

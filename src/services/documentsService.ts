@@ -46,6 +46,10 @@ function shuffleWithSortOrder<T extends { sortOrder?: number }>(items: T[]) {
   }));
 }
 
+function cloneMetadata<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value ?? null));
+}
+
 export const documentsService = {
   async listFolders(userId: string) {
     const [{ data: folders, error: folderError }, { data: documents, error: docError }] =
@@ -126,6 +130,58 @@ export const documentsService = {
     if (error) {
       throw error;
     }
+  },
+
+  async moveFolder(input: {
+    folderId: string;
+    userId: string;
+    targetFolderId: string | null;
+  }) {
+    const folders = await this.listFolders(input.userId);
+    const folderToMove = folders.find((folder) => folder.id === input.folderId);
+
+    if (!folderToMove) {
+      throw new Error("Folder not found.");
+    }
+
+    if (input.targetFolderId === input.folderId) {
+      throw new Error("A folder cannot be moved into itself.");
+    }
+
+    const descendantIds = new Set<string>();
+    const stack = [input.folderId];
+
+    while (stack.length > 0) {
+      const currentId = stack.pop();
+
+      if (!currentId) {
+        continue;
+      }
+
+      for (const candidate of folders) {
+        if (candidate.parent_folder_id === currentId) {
+          descendantIds.add(candidate.id);
+          stack.push(candidate.id);
+        }
+      }
+    }
+
+    if (input.targetFolderId && descendantIds.has(input.targetFolderId)) {
+      throw new Error("A folder cannot be moved inside one of its own subfolders.");
+    }
+
+    const { data, error } = await supabase
+      .from("folders")
+      .update({ parent_folder_id: input.targetFolderId })
+      .eq("id", input.folderId)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
   },
 
   async listDocuments(input: {
@@ -400,6 +456,250 @@ export const documentsService = {
 
     if (error) {
       throw error;
+    }
+  },
+
+  async duplicateDocument(input: {
+    documentId: string;
+    userId: string;
+    targetFolderId?: string | null;
+    title?: string;
+  }) {
+    const { data: document, error: documentError } = await supabase
+      .from("documents")
+      .select("*")
+      .eq("id", input.documentId)
+      .eq("user_id", input.userId)
+      .single();
+
+    if (documentError) {
+      throw documentError;
+    }
+
+    const [{ data: sections, error: sectionsError }, { data: flashcards, error: flashcardsError }] =
+      await Promise.all([
+        supabase
+          .from("document_sections")
+          .select("*")
+          .eq("document_id", input.documentId)
+          .order("sort_order", { ascending: true }),
+        supabase
+          .from("flashcards")
+          .select("*")
+          .eq("document_id", input.documentId)
+          .eq("user_id", input.userId)
+          .order("sort_order", { ascending: true }),
+      ]);
+
+    if (sectionsError) {
+      throw sectionsError;
+    }
+
+    if (flashcardsError) {
+      throw flashcardsError;
+    }
+
+    const duplicatedFile = await storageService.duplicateDocumentFile({
+      userId: input.userId,
+      sourcePath: document.storage_path,
+      originalFilename: document.original_filename,
+      mimeType: document.mime_type,
+    });
+
+    try {
+      const { data: duplicatedDocument, error: insertError } = await supabase
+        .from("documents")
+        .insert({
+          user_id: input.userId,
+          folder_id:
+            typeof input.targetFolderId === "undefined"
+              ? document.folder_id
+              : input.targetFolderId,
+          title: input.title ?? `${document.title} Copy`,
+          original_filename: document.original_filename,
+          storage_path: duplicatedFile.path,
+          mime_type: document.mime_type,
+          file_size_bytes: document.file_size_bytes,
+          extracted_text: document.extracted_text,
+          processing_status: document.processing_status,
+          completion_percent: 0,
+          metadata: cloneMetadata(document.metadata),
+          last_opened_at: null,
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      if ((sections ?? []).length > 0) {
+        const { error } = await supabase.from("document_sections").insert(
+          sections.map((section) => ({
+            document_id: duplicatedDocument.id,
+            title: section.title,
+            content: section.content,
+            sort_order: section.sort_order,
+            metadata: cloneMetadata(section.metadata),
+          })),
+        );
+
+        if (error) {
+          throw error;
+        }
+      }
+
+      if ((flashcards ?? []).length > 0) {
+        const { error } = await supabase.from("flashcards").insert(
+          flashcards.map((flashcard) => ({
+            document_id: duplicatedDocument.id,
+            user_id: input.userId,
+            question: flashcard.question,
+            answer: flashcard.answer,
+            difficulty: flashcard.difficulty,
+            status: "unseen",
+            sort_order: flashcard.sort_order,
+          })),
+        );
+
+        if (error) {
+          throw error;
+        }
+      }
+
+      return duplicatedDocument;
+    } catch (error) {
+      await storageService.removeDocumentFile(duplicatedFile.path).catch(() => null);
+      throw error;
+    }
+  },
+
+  async duplicateFolder(input: {
+    folderId: string;
+    userId: string;
+    targetFolderId?: string | null;
+  }) {
+    const folders = await this.listFolders(input.userId);
+    const sourceFolder = folders.find((folder) => folder.id === input.folderId);
+
+    if (!sourceFolder) {
+      throw new Error("Folder not found.");
+    }
+
+    const { data: documents, error: documentsError } = await supabase
+      .from("documents")
+      .select("*")
+      .eq("user_id", input.userId);
+
+    if (documentsError) {
+      throw documentsError;
+    }
+
+    const folderMap = new Map<string, string>();
+    const createFolderCopy = async (folderId: string, parentFolderId: string | null, isRoot = false) => {
+      const current = folders.find((folder) => folder.id === folderId);
+
+      if (!current) {
+        return;
+      }
+
+      const created = await this.createFolder(
+        input.userId,
+        isRoot ? `${current.name} Copy` : current.name,
+        parentFolderId,
+      );
+
+      folderMap.set(folderId, created.id);
+
+      const currentDocuments = documents.filter((document) => document.folder_id === folderId);
+
+      for (const document of currentDocuments) {
+        await this.duplicateDocument({
+          documentId: document.id,
+          userId: input.userId,
+          targetFolderId: created.id,
+          title: `${document.title} Copy`,
+        });
+      }
+
+      const children = folders.filter((folder) => folder.parent_folder_id === folderId);
+
+      for (const child of children) {
+        await createFolderCopy(child.id, created.id);
+      }
+    };
+
+    await createFolderCopy(
+      sourceFolder.id,
+      typeof input.targetFolderId === "undefined" ? sourceFolder.parent_folder_id : input.targetFolderId,
+      true,
+    );
+
+    return folderMap.get(sourceFolder.id) ?? null;
+  },
+
+  async bulkDeleteDocuments(documentIds: string[]) {
+    for (const documentId of documentIds) {
+      await this.deleteDocument(documentId);
+    }
+  },
+
+  async bulkMoveDocuments(documentIds: string[], folderId: string | null) {
+    const { error } = await supabase
+      .from("documents")
+      .update({ folder_id: folderId })
+      .in("id", documentIds);
+
+    if (error) {
+      throw error;
+    }
+  },
+
+  async bulkDuplicateDocuments(input: {
+    documentIds: string[];
+    userId: string;
+    targetFolderId?: string | null;
+  }) {
+    for (const documentId of input.documentIds) {
+      await this.duplicateDocument({
+        documentId,
+        userId: input.userId,
+        targetFolderId: input.targetFolderId,
+      });
+    }
+  },
+
+  async bulkDeleteFolders(folderIds: string[]) {
+    for (const folderId of folderIds) {
+      await this.deleteFolder(folderId);
+    }
+  },
+
+  async bulkMoveFolders(input: {
+    folderIds: string[];
+    userId: string;
+    targetFolderId: string | null;
+  }) {
+    for (const folderId of input.folderIds) {
+      await this.moveFolder({
+        folderId,
+        userId: input.userId,
+        targetFolderId: input.targetFolderId,
+      });
+    }
+  },
+
+  async bulkDuplicateFolders(input: {
+    folderIds: string[];
+    userId: string;
+    targetFolderId?: string | null;
+  }) {
+    for (const folderId of input.folderIds) {
+      await this.duplicateFolder({
+        folderId,
+        userId: input.userId,
+        targetFolderId: input.targetFolderId,
+      });
     }
   },
 

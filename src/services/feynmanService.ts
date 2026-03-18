@@ -86,6 +86,74 @@ function buildQuestions(topic: string, extractedText: string | null) {
   ];
 }
 
+function estimateFallbackQuestionCount(topic: string, extractedText: string | null) {
+  void topic;
+  void extractedText;
+  return 5;
+}
+
+function formatTurnFeedback(input: {
+  verdict: "correct" | "partially_correct" | "incorrect";
+  score: number;
+  strengths: string[];
+  missingPoints: string[];
+  incorrectPoints: string[];
+  feedback: string;
+  nextQuestion: string;
+  isComplete?: boolean;
+}) {
+  const verdictLabel =
+    input.verdict === "correct"
+      ? "Correct"
+      : input.verdict === "incorrect"
+        ? "Incorrect"
+        : "Partially Correct";
+
+  return [
+    "### Feedback",
+    `**Verdict:** ${verdictLabel}`,
+    `**Turn score:** ${input.score}/100`,
+    input.feedback,
+    input.strengths.length ? `**What you got right:** ${input.strengths.join("; ")}` : null,
+    input.incorrectPoints.length ? `**What was wrong:** ${input.incorrectPoints.join("; ")}` : null,
+    input.missingPoints.length ? `**What was missing:** ${input.missingPoints.join("; ")}` : null,
+    input.isComplete ? "### Session Status\nYou have covered enough ground. Complete the session to see your full evaluation." : null,
+    !input.isComplete ? `### Next Question\n${input.nextQuestion}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function isUnsureAnswer(value: string) {
+  const normalized = normalizeWhitespace(value).toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "dont know",
+    "don't know",
+    "idk",
+    "i dont know",
+    "i don't know",
+    "no idea",
+    "not sure",
+    "unsure",
+    "dunno",
+    "bro",
+  ].some((token) => normalized.includes(token));
+}
+
+function normalizeQuestionForComparison(value: string) {
+  return normalizeWhitespace(value).toLowerCase().replace(/[?!.]+$/g, "");
+}
+
+function buildGuidedFallbackQuestion(topic: string, extractedText: string | null) {
+  const cue = extractMeaningfulCue(extractedText ?? "") || truncateSentence(topic, 100) || "the topic";
+  return `Let's simplify it. In one sentence, what is the main idea behind ${cue}?`;
+}
+
 function scoreExplanation(userMessages: string[]) {
   const combined = userMessages.join(" ").trim();
   const wordCount = combined.split(/\s+/).filter(Boolean).length;
@@ -243,6 +311,7 @@ export const feynmanService = {
     documentId: string;
     userId: string;
     topic: string;
+    extractedText: string | null;
   }) {
     const { error: archiveError } = await supabase
       .from("feynman_sessions")
@@ -257,6 +326,8 @@ export const feynmanService = {
       throw archiveError;
     }
 
+    const estimatedQuestionCount = 5;
+
     const { data: session, error: sessionError } = await supabase
       .from("feynman_sessions")
       .insert({
@@ -264,6 +335,9 @@ export const feynmanService = {
         user_id: input.userId,
         topic: input.topic,
         session_summary: `Fresh session on ${input.topic}. No student explanation yet.`,
+        target_question_count: estimatedQuestionCount,
+        current_question_count: 0,
+        extra_follow_up_count: 0,
       })
       .select()
       .single();
@@ -322,6 +396,17 @@ export const feynmanService = {
       ...session,
       overall_score: scoreBySessionId.get(session.id) ?? null,
     }));
+  },
+
+  async deleteSession(sessionId: string) {
+    const { error } = await supabase
+      .from("feynman_sessions")
+      .delete()
+      .eq("id", sessionId);
+
+    if (error) {
+      throw error;
+    }
   },
 
   async getSessionWithMessages(sessionId: string) {
@@ -399,8 +484,6 @@ export const feynmanService = {
     extractedText: string | null;
     explanation: string;
   }) {
-    const questionFlow = buildQuestions(input.topic, input.extractedText);
-
     const { error: userError } = await supabase.from("feynman_messages").insert({
       session_id: input.sessionId,
       role: "user",
@@ -423,7 +506,7 @@ export const feynmanService = {
 
     const { data: currentSession, error: currentSessionError } = await supabase
       .from("feynman_sessions")
-      .select("session_summary")
+      .select("session_summary, target_question_count, current_question_count, extra_follow_up_count")
       .eq("id", input.sessionId)
       .single();
 
@@ -452,38 +535,76 @@ export const feynmanService = {
           messages,
         });
 
-    const userMessagesCount = messages.filter((message) => message.role === "user").length;
-    const nextQuestion = questionFlow[Math.min(userMessagesCount, questionFlow.length - 1)];
-    const completionPercent = Math.min(100, Math.round((userMessagesCount / questionFlow.length) * 100));
-    const aiFollowUp = localAiService.isAvailable()
+    const questionFlow = buildQuestions(input.topic, input.extractedText);
+    const previousAiQuestion = [...messages]
+      .reverse()
+      .find((message) => message.role === "ai" && !/^###\s+Feedback/i.test(message.content))
+      ?.content;
+    const answeredQuestionCount = (currentSession.current_question_count ?? 0) + 1;
+    const targetQuestionCount = Math.max(5, Math.min(20, currentSession.target_question_count ?? questionFlow.length));
+    const currentExtraFollowUps = currentSession.extra_follow_up_count ?? 0;
+    const baseCompletionPercent = Math.min(100, Math.round((answeredQuestionCount / targetQuestionCount) * 100));
+    const turnReview = localAiService.isAvailable()
       ? await localAiService
-          .createFeynmanFollowUp({
+          .reviewFeynmanTurn({
             topic: input.topic,
             extractedText: input.extractedText,
             sessionSummary: updatedSummary,
             conversation: messages,
             explanation: input.explanation,
-            completionPercent,
+            questionCount: answeredQuestionCount,
+            targetQuestionCount,
           })
-          .catch(() => "")
-      : "";
+          .catch(() => null)
+      : null;
+    const fallbackQuestion = questionFlow[Math.min(answeredQuestionCount, questionFlow.length - 1)];
+    const unsureAnswer = isUnsureAnswer(input.explanation);
+    const shouldAskFollowUp =
+      Boolean(turnReview?.shouldAskFollowUp) &&
+      !unsureAnswer &&
+      currentExtraFollowUps < 3 &&
+      answeredQuestionCount < targetQuestionCount + 2;
+    let nextQuestionCandidate = shouldAskFollowUp
+      ? turnReview?.nextQuestion || fallbackQuestion
+      : turnReview?.nextQuestion || fallbackQuestion;
+    const repeatedQuestion =
+      previousAiQuestion &&
+      normalizeQuestionForComparison(nextQuestionCandidate) === normalizeQuestionForComparison(previousAiQuestion);
+
+    if (unsureAnswer || repeatedQuestion) {
+      nextQuestionCandidate =
+        questionFlow[Math.min(answeredQuestionCount + 1, questionFlow.length - 1)] ||
+        buildGuidedFallbackQuestion(input.topic, input.extractedText);
+    }
     const groundedFollowUp = isFeynmanPromptGrounded({
-      prompt: aiFollowUp,
+      prompt: nextQuestionCandidate,
       topic: input.topic,
       extractedText: input.extractedText,
-      completionPercent,
+      completionPercent: baseCompletionPercent,
     })
-      ? aiFollowUp
-      : "";
+      ? nextQuestionCandidate
+      : buildGuidedFallbackQuestion(input.topic, input.extractedText);
+    const isSessionReadyToComplete = !shouldAskFollowUp && answeredQuestionCount >= targetQuestionCount;
+    const aiMessageContent = turnReview
+      ? formatTurnFeedback({
+          verdict: turnReview.verdict,
+          score: turnReview.score,
+          strengths: turnReview.strengths,
+          missingPoints: turnReview.missingPoints,
+          incorrectPoints: turnReview.incorrectPoints,
+          feedback: turnReview.feedback,
+          nextQuestion: groundedFollowUp,
+          isComplete: isSessionReadyToComplete,
+        })
+      : groundedFollowUp ||
+        (isSessionReadyToComplete
+          ? "You have explained the main ideas. Complete the session to see your evaluation."
+          : fallbackQuestion);
 
     const { error: aiError } = await supabase.from("feynman_messages").insert({
       session_id: input.sessionId,
       role: "ai",
-      content:
-        groundedFollowUp ||
-        (completionPercent >= 100
-          ? "You have explained the main ideas. Complete the session to see your evaluation."
-          : nextQuestion),
+      content: aiMessageContent,
     });
 
     if (aiError) {
@@ -493,8 +614,10 @@ export const feynmanService = {
     const { error: sessionError } = await supabase
       .from("feynman_sessions")
       .update({
-        completion_percent: completionPercent,
+        completion_percent: isSessionReadyToComplete ? 100 : baseCompletionPercent,
         session_summary: updatedSummary,
+        current_question_count: answeredQuestionCount,
+        extra_follow_up_count: currentExtraFollowUps + (shouldAskFollowUp ? 1 : 0),
       })
       .eq("id", input.sessionId);
 
@@ -502,7 +625,7 @@ export const feynmanService = {
       throw sessionError;
     }
 
-    return completionPercent;
+    return isSessionReadyToComplete ? 100 : baseCompletionPercent;
   },
 
   async completeSession(input: {
@@ -551,7 +674,17 @@ export const feynmanService = {
         completeness: aiEvaluation?.completeness ?? scores.completeness,
         teaching_ability: aiEvaluation?.teachingAbility ?? scores.teachingAbility,
         strengths,
+        misconceptions,
         improvement_points: improvementPoints,
+        knowledge_rating:
+          aiEvaluation?.knowledgeRating ??
+          ((aiEvaluation?.overallScore ?? scores.overall) >= 85
+            ? "Advanced"
+            : (aiEvaluation?.overallScore ?? scores.overall) >= 70
+              ? "Proficient"
+              : (aiEvaluation?.overallScore ?? scores.overall) >= 50
+                ? "Developing"
+                : "Foundational"),
         ai_feedback:
           aiEvaluation
             ? [aiEvaluation.summary, misconceptions.length ? `Specific issues: ${misconceptions.join(" ")}` : null]

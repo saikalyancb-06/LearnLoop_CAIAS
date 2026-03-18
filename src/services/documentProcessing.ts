@@ -689,6 +689,31 @@ async function extractImageFallbackText(file: File, title: string) {
   );
 }
 
+async function extractImageText(file: File, title: string) {
+  try {
+    const { createWorker } = await import("tesseract.js");
+    const worker = await createWorker("eng");
+
+    try {
+      const imageUrl = URL.createObjectURL(file);
+
+      try {
+        const {
+          data: { text },
+        } = await worker.recognize(imageUrl);
+
+        return normalizeWhitespace(text);
+      } finally {
+        URL.revokeObjectURL(imageUrl);
+      }
+    } finally {
+      await worker.terminate();
+    }
+  } catch {
+    return extractImageFallbackText(file, title);
+  }
+}
+
 async function extractLegacyOfficeFallbackText(file: File, title: string) {
   return normalizeWhitespace(
     `${title} was uploaded in a legacy Office format (${file.type}). LearnLoop stored the file and generated study scaffolding, but deep text extraction for this older format is not enabled in the browser pipeline yet.`,
@@ -721,7 +746,7 @@ async function extractDocumentText(file: File, title: string) {
   }
 
   if (file.type.startsWith("image/")) {
-    return extractImageFallbackText(file, title);
+    return extractImageText(file, title);
   }
 
   throw new Error("Unsupported file type.");

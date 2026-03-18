@@ -37,6 +37,27 @@ export const storageService = {
     }
   },
 
+  async duplicateDocumentFile(input: {
+    userId: string;
+    sourcePath: string;
+    originalFilename: string;
+    mimeType: string;
+  }) {
+    const signedUrl = await this.createSignedDocumentUrl(input.sourcePath);
+    const response = await fetch(signedUrl);
+
+    if (!response.ok) {
+      throw new Error("Unable to duplicate the stored file.");
+    }
+
+    const blob = await response.blob();
+    const file = new File([blob], input.originalFilename, {
+      type: input.mimeType || blob.type || "application/octet-stream",
+    });
+
+    return this.uploadDocumentFile(input.userId, file);
+  },
+
   async createSignedDocumentUrl(storagePath: string, expiresIn = 60 * 15) {
     const { data, error } = await supabase.storage
       .from(DOCUMENTS_BUCKET)
@@ -49,4 +70,3 @@ export const storageService = {
     return data.signedUrl;
   },
 };
-

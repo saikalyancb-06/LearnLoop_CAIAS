@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Mic, Volume2 } from "lucide-react";
-import { Link, useNavigate, useParams } from "react-router";
+import { ChevronLeft, Mic, Trash2, Volume2 } from "lucide-react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { useAuth } from "../../hooks/useAuth";
+import { isSessionCacheFresh, readSessionCache, removeSessionCache, UI_CACHE_MAX_AGE, writeSessionCache } from "../../lib/cache";
+import { MarkdownText } from "../components/MarkdownText";
 import { documentsService } from "../../services/documentsService";
 import { feynmanService } from "../../services/feynmanService";
 
@@ -258,19 +260,28 @@ function deriveFeynmanTopic(document: any) {
 export function FeynmanMode() {
   const navigate = useNavigate();
   const { documentId } = useParams();
+  const [searchParams] = useSearchParams();
   const { user } = useAuth();
-  const [userInput, setUserInput] = useState("");
+  const requestedTopic = normalizeWhitespace(searchParams.get("topic") ?? "");
+  const topicCacheSegment = requestedTopic ? encodeURIComponent(requestedTopic.toLowerCase()) : "auto";
+  const sessionCacheKey = documentId ? `feynman.${documentId}.${topicCacheSegment}.session` : null;
+  const conversationCacheKey = documentId ? `feynman.${documentId}.${topicCacheSegment}.conversation` : null;
+  const documentCacheKey = documentId ? `feynman.${documentId}.${topicCacheSegment}.document` : null;
+  const historyCacheKey = documentId ? `feynman.${documentId}.${topicCacheSegment}.history` : null;
+  const inputCacheKey = documentId ? `feynman.${documentId}.${topicCacheSegment}.input` : null;
+  const [userInput, setUserInput] = useState(() => (inputCacheKey ? readSessionCache(inputCacheKey) ?? "" : ""));
   const [isRecording, setIsRecording] = useState(false);
-  const [document, setDocument] = useState<any | null>(null);
-  const [currentSession, setCurrentSession] = useState<any | null>(null);
-  const [currentConversation, setCurrentConversation] = useState<any[]>([]);
-  const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
+  const [document, setDocument] = useState<any | null>(() => (documentCacheKey ? readSessionCache(documentCacheKey) : null));
+  const [currentSession, setCurrentSession] = useState<any | null>(() => (sessionCacheKey ? readSessionCache(sessionCacheKey) : null));
+  const [currentConversation, setCurrentConversation] = useState<any[]>(() => (conversationCacheKey ? readSessionCache(conversationCacheKey) ?? [] : []));
+  const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>(() => (historyCacheKey ? readSessionCache(historyCacheKey) ?? [] : []));
   const [selectedHistorySession, setSelectedHistorySession] = useState<any | null>(null);
   const [selectedHistoryConversation, setSelectedHistoryConversation] = useState<any[]>([]);
   const [selectedHistoryResult, setSelectedHistoryResult] = useState<any | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [isVoiceSupported, setIsVoiceSupported] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -304,6 +315,38 @@ export function FeynmanMode() {
         return;
       }
 
+      if (
+        sessionCacheKey &&
+        conversationCacheKey &&
+        documentCacheKey &&
+        historyCacheKey &&
+        readSessionCache(sessionCacheKey) &&
+        readSessionCache(documentCacheKey) &&
+        isSessionCacheFresh(sessionCacheKey, UI_CACHE_MAX_AGE) &&
+        isSessionCacheFresh(conversationCacheKey, UI_CACHE_MAX_AGE) &&
+        isSessionCacheFresh(documentCacheKey, UI_CACHE_MAX_AGE)
+      ) {
+        const cachedSession = readSessionCache<any>(sessionCacheKey);
+
+        if (cachedSession?.status === "active") {
+          setCurrentSession(cachedSession);
+          setCurrentConversation(readSessionCache(conversationCacheKey) ?? []);
+          setDocument(readSessionCache(documentCacheKey));
+          setSessionHistory(readSessionCache(historyCacheKey) ?? []);
+          setIsLoading(false);
+          setError(null);
+          return;
+        }
+
+        removeSessionCache(sessionCacheKey);
+        removeSessionCache(conversationCacheKey);
+        removeSessionCache(documentCacheKey);
+        removeSessionCache(historyCacheKey);
+        if (inputCacheKey) {
+          removeSessionCache(inputCacheKey);
+        }
+      }
+
       setIsLoading(true);
       setError(null);
       setSelectedHistorySession(null);
@@ -312,11 +355,12 @@ export function FeynmanMode() {
 
       try {
         const nextDocument = await documentsService.getDocument(documentId);
-        const topic = deriveFeynmanTopic(nextDocument);
+        const topic = requestedTopic || deriveFeynmanTopic(nextDocument);
         const nextSession = await feynmanService.createSession({
           documentId,
           userId: user.id,
           topic,
+          extractedText: nextDocument.extracted_text,
         });
 
         await feynmanService.ensureStarterMessage({
@@ -343,7 +387,31 @@ export function FeynmanMode() {
     }
 
     void loadFreshSession();
-  }, [documentId, user]);
+  }, [conversationCacheKey, documentCacheKey, documentId, historyCacheKey, inputCacheKey, requestedTopic, sessionCacheKey, user]);
+
+  useEffect(() => {
+    if (!documentId || !sessionCacheKey || !conversationCacheKey || !documentCacheKey || !historyCacheKey || !inputCacheKey) {
+      return;
+    }
+
+    writeSessionCache(sessionCacheKey, currentSession);
+    writeSessionCache(conversationCacheKey, currentConversation);
+    writeSessionCache(documentCacheKey, document);
+    writeSessionCache(historyCacheKey, sessionHistory);
+    writeSessionCache(inputCacheKey, userInput);
+  }, [
+    conversationCacheKey,
+    currentConversation,
+    currentSession,
+    document,
+    documentId,
+    documentCacheKey,
+    historyCacheKey,
+    inputCacheKey,
+    sessionCacheKey,
+    sessionHistory,
+    userInput,
+  ]);
 
   useEffect(() => {
     messagesRef.current?.scrollTo({
@@ -392,6 +460,8 @@ export function FeynmanMode() {
   const topicLooksLikeCode = useMemo(() => isCodeLikeText(currentTopic), [currentTopic]);
   const displayTopic = useMemo(() => toDisplayTopic(currentTopic), [currentTopic]);
   const progressPercent = visibleSession?.completion_percent ?? 0;
+  const targetQuestionCount = visibleSession?.target_question_count ?? 0;
+  const answeredQuestionCount = visibleSession?.current_question_count ?? 0;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -438,6 +508,24 @@ export function FeynmanMode() {
         userId: user.id,
         documentId: document.id,
       });
+      if (sessionCacheKey) {
+        removeSessionCache(sessionCacheKey);
+      }
+      if (conversationCacheKey) {
+        removeSessionCache(conversationCacheKey);
+      }
+      if (documentCacheKey) {
+        removeSessionCache(documentCacheKey);
+      }
+      if (historyCacheKey) {
+        removeSessionCache(historyCacheKey);
+      }
+      if (inputCacheKey) {
+        removeSessionCache(inputCacheKey);
+      }
+      removeSessionCache("dashboard.documents");
+      removeSessionCache("dashboard.sessions");
+      removeSessionCache("dashboard.summary");
       navigate(`/notes/${document.id}/feynman/${currentSession.id}/results`);
     } catch (completeError) {
       setError(
@@ -477,6 +565,33 @@ export function FeynmanMode() {
     setSelectedHistorySession(null);
     setSelectedHistoryConversation([]);
     setSelectedHistoryResult(null);
+  };
+
+  const handleDeleteSession = async (sessionId: string) => {
+    if (!documentId || !user) {
+      return;
+    }
+
+    setDeletingSessionId(sessionId);
+    setError(null);
+
+    try {
+      await feynmanService.deleteSession(sessionId);
+
+      if (selectedHistorySession?.id === sessionId) {
+        handleReturnToCurrent();
+      }
+
+      await refreshHistory(currentSession?.id);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "Unable to delete the previous session.",
+      );
+    } finally {
+      setDeletingSessionId(null);
+    }
   };
 
   const toggleRecording = () => {
@@ -639,6 +754,9 @@ export function FeynmanMode() {
               <div className="mt-4 text-sm text-gray-500">
                 Progress: {progressPercent}% {isViewingHistory ? "recorded" : "complete"}
               </div>
+              <div className="mt-2 text-xs text-gray-500">
+                {answeredQuestionCount} / {targetQuestionCount || "?"} planned questions answered
+              </div>
             </div>
 
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 flex items-start gap-3">
@@ -687,12 +805,12 @@ export function FeynmanMode() {
                               </pre>
                             </div>
                           ) : (
-                            <p
+                            <div
                               key={`${message.id}-text-${index}`}
-                              className="whitespace-pre-wrap break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
+                              className="break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
                             >
-                              {part.content}
-                            </p>
+                              <MarkdownText content={part.content} />
+                            </div>
                           ),
                         )}
                       </div>
@@ -714,8 +832,10 @@ export function FeynmanMode() {
                     </div>
                     {selectedHistoryResult ? (
                       <div className="rounded-lg border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm text-indigo-900">
-                        Score: {selectedHistoryResult.overall_score}%.
-                        {selectedHistoryResult.ai_feedback ? ` ${selectedHistoryResult.ai_feedback}` : ""}
+                        <div className="mb-2 font-medium">Score: {selectedHistoryResult.overall_score}%</div>
+                        {selectedHistoryResult.ai_feedback ? (
+                          <MarkdownText content={selectedHistoryResult.ai_feedback} />
+                        ) : null}
                       </div>
                     ) : null}
                   </div>
@@ -806,18 +926,34 @@ export function FeynmanMode() {
                 const isSelected = selectedHistorySession?.id === historySession.id;
 
                 return (
-                  <button
+                  <div
                     key={historySession.id}
-                    onClick={() => void handleViewSession(historySession.id)}
-                    className={`w-full text-left rounded-lg border px-3 py-3 transition-colors ${
+                    className={`w-full rounded-lg border px-3 py-3 transition-colors ${
                       isSelected
                         ? "border-indigo-300 bg-indigo-50"
                         : "border-gray-200 hover:border-indigo-200 hover:bg-gray-50"
                     }`}
                   >
-                    <div className="text-sm font-medium text-gray-900 truncate">{toSessionLabel(historySession.topic)}</div>
-                    <div className="mt-1 text-xs text-gray-500">
-                      {new Date(historySession.created_at).toLocaleString()}
+                    <div className="flex items-start justify-between gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void handleViewSession(historySession.id)}
+                        className="min-w-0 flex-1 text-left"
+                      >
+                        <div className="text-sm font-medium text-gray-900 truncate">{toSessionLabel(historySession.topic)}</div>
+                        <div className="mt-1 text-xs text-gray-500">
+                          {new Date(historySession.created_at).toLocaleString()}
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteSession(historySession.id)}
+                        disabled={deletingSessionId === historySession.id}
+                        className="rounded-md p-1 text-gray-400 hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label="Delete previous session"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
                     </div>
                     <div className="mt-2 flex items-center justify-between text-xs">
                       <span className="rounded-full bg-gray-100 px-2 py-1 text-gray-600 capitalize">
@@ -829,7 +965,7 @@ export function FeynmanMode() {
                           : `${historySession.completion_percent}%`}
                       </span>
                     </div>
-                  </button>
+                  </div>
                 );
               })}
             </div>

@@ -201,6 +201,9 @@ export type Database = {
           status: string;
           completion_percent: number;
           session_summary: string | null;
+          target_question_count: number;
+          current_question_count: number;
+          extra_follow_up_count: number;
           started_at: string;
           completed_at: string | null;
           created_at: string;
@@ -214,6 +217,9 @@ export type Database = {
           status?: string;
           completion_percent?: number;
           session_summary?: string | null;
+          target_question_count?: number;
+          current_question_count?: number;
+          extra_follow_up_count?: number;
           started_at?: string;
           completed_at?: string | null;
           created_at?: string;
@@ -227,6 +233,9 @@ export type Database = {
           status?: string;
           completion_percent?: number;
           session_summary?: string | null;
+          target_question_count?: number;
+          current_question_count?: number;
+          extra_follow_up_count?: number;
           started_at?: string;
           completed_at?: string | null;
           created_at?: string;
@@ -268,7 +277,9 @@ export type Database = {
           completeness: number;
           teaching_ability: number;
           strengths: string[];
+          misconceptions: string[];
           improvement_points: string[];
+          knowledge_rating: string | null;
           ai_feedback: string | null;
           created_at: string;
         };
@@ -281,7 +292,9 @@ export type Database = {
           completeness: number;
           teaching_ability: number;
           strengths?: string[];
+          misconceptions?: string[];
           improvement_points?: string[];
+          knowledge_rating?: string | null;
           ai_feedback?: string | null;
           created_at?: string;
         };
@@ -294,7 +307,9 @@ export type Database = {
           completeness?: number;
           teaching_ability?: number;
           strengths?: string[];
+          misconceptions?: string[];
           improvement_points?: string[];
+          knowledge_rating?: string | null;
           ai_feedback?: string | null;
           created_at?: string;
         };

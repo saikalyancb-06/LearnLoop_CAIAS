@@ -9,6 +9,12 @@ import {
   Pencil,
   Trash2,
   ArrowRightLeft,
+  Copy,
+  CheckSquare,
+  Square,
+  ChevronRight,
+  ChevronDown,
+  X,
 } from "lucide-react";
 import { Link } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -18,6 +24,7 @@ import {
   isSessionCacheFresh,
   readSessionCache,
   removeSessionCache,
+  UI_CACHE_MAX_AGE,
   writeSessionCache,
 } from "../../lib/cache";
 import { getDocumentTypeLabel } from "../../lib/documentDisplay";
@@ -34,10 +41,94 @@ type ExplorerDialogState =
   | { type: "create-folder" }
   | { type: "rename-folder"; folderId: string; currentName: string }
   | { type: "delete-folder"; folderId: string; currentName: string }
+  | { type: "move-folder"; folderId: string; currentName: string; currentParentFolderId: string | null }
+  | { type: "duplicate-folder"; folderId: string; currentName: string; currentParentFolderId: string | null }
   | { type: "rename-document"; documentId: string; currentTitle: string }
   | { type: "delete-document"; documentId: string; currentTitle: string }
   | { type: "move-document"; documentId: string; currentTitle: string; currentFolderId: string | null }
+  | { type: "duplicate-document"; documentId: string; currentTitle: string; currentFolderId: string | null }
+  | { type: "bulk-move" }
+  | { type: "bulk-delete" }
+  | { type: "bulk-duplicate" }
   | null;
+
+type FolderNode = any & {
+  children: FolderNode[];
+};
+
+type DragPayload =
+  | { kind: "folder"; folderId: string }
+  | { kind: "document"; documentId: string };
+
+function buildFolderTree(folders: any[]) {
+  const nodeMap = new Map<string, FolderNode>();
+
+  for (const folder of folders) {
+    nodeMap.set(folder.id, {
+      ...folder,
+      children: [],
+    });
+  }
+
+  const roots: FolderNode[] = [];
+
+  for (const folder of folders) {
+    const node = nodeMap.get(folder.id)!;
+
+    if (folder.parent_folder_id && nodeMap.has(folder.parent_folder_id)) {
+      nodeMap.get(folder.parent_folder_id)!.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  const sortNodes = (nodes: FolderNode[]) => {
+    nodes.sort((a, b) => a.name.localeCompare(b.name));
+    nodes.forEach((node) => sortNodes(node.children));
+  };
+
+  sortNodes(roots);
+  return roots;
+}
+
+function buildFolderPathLabel(folderPath: any[], folderId: string | null) {
+  if (!folderId) {
+    return "Root / My Notes";
+  }
+
+  return [...folderPath.map((folder) => folder.name)].join(" / ") || "Root / My Notes";
+}
+
+function buildFolderNameMap(folders: any[]) {
+  return new Map(folders.map((folder) => [folder.id, folder]));
+}
+
+function buildFolderOptionLabel(folders: any[], folderId: string) {
+  const folderMap = buildFolderNameMap(folders);
+  const segments: string[] = [];
+  let current = folderMap.get(folderId) ?? null;
+
+  while (current) {
+    segments.unshift(current.name);
+    current = current.parent_folder_id ? folderMap.get(current.parent_folder_id) ?? null : null;
+  }
+
+  return segments.join(" / ");
+}
+
+function parseDropPayload(event: React.DragEvent) {
+  const raw = event.dataTransfer.getData("application/json");
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw) as DragPayload;
+  } catch {
+    return null;
+  }
+}
 
 export function DocumentsExplorer() {
   const { user } = useAuth();
@@ -55,6 +146,15 @@ export function DocumentsExplorer() {
   );
   const [folderPath, setFolderPath] = useState<any[]>(() => readSessionCache("documents.folderPath") ?? []);
   const [documents, setDocuments] = useState<any[]>(() => readSessionCache("documents.documents") ?? []);
+  const [expandedFolderIds, setExpandedFolderIds] = useState<string[]>(
+    () => readSessionCache("documents.expandedFolders") ?? [],
+  );
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>(
+    () => readSessionCache("documents.selectedDocuments") ?? [],
+  );
+  const [selectedFolderIds, setSelectedFolderIds] = useState<string[]>(
+    () => readSessionCache("documents.selectedFolders") ?? [],
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [isSubmittingDialog, setIsSubmittingDialog] = useState(false);
@@ -113,11 +213,24 @@ export function DocumentsExplorer() {
   }
 
   useEffect(() => {
-    if (
+    const cachedFolderId = readSessionCache<string | null>("documents.folderId");
+    const cachedSearch = readSessionCache<string>("documents.search") ?? "";
+    const hasFreshCache =
       readSessionCache("documents.documents") &&
-      isSessionCacheFresh("documents.documents", 1000 * 60 * 3) &&
-      isSessionCacheFresh("documents.childFolders", 1000 * 60 * 3)
+      isSessionCacheFresh("documents.documents", UI_CACHE_MAX_AGE) &&
+      isSessionCacheFresh("documents.childFolders", UI_CACHE_MAX_AGE) &&
+      isSessionCacheFresh("documents.folderPath", UI_CACHE_MAX_AGE) &&
+      isSessionCacheFresh("documents.allFolders", UI_CACHE_MAX_AGE);
+
+    if (
+      hasFreshCache &&
+      cachedFolderId === selectedFolderId &&
+      cachedSearch === search
     ) {
+      setFolders(readSessionCache("documents.allFolders") ?? []);
+      setChildFolders(readSessionCache("documents.childFolders") ?? []);
+      setDocuments(readSessionCache("documents.documents") ?? []);
+      setFolderPath(readSessionCache("documents.folderPath") ?? []);
       setIsLoading(false);
       return;
     }
@@ -128,6 +241,26 @@ export function DocumentsExplorer() {
   useEffect(() => {
     writeSessionCache("documents.viewMode", viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    writeSessionCache("documents.expandedFolders", expandedFolderIds);
+  }, [expandedFolderIds]);
+
+  useEffect(() => {
+    writeSessionCache("documents.selectedDocuments", selectedDocumentIds);
+  }, [selectedDocumentIds]);
+
+  useEffect(() => {
+    writeSessionCache("documents.selectedFolders", selectedFolderIds);
+  }, [selectedFolderIds]);
+
+  useEffect(() => {
+    if (folderPath.length === 0) {
+      return;
+    }
+
+    setExpandedFolderIds((current) => [...new Set([...current, ...folderPath.map((folder) => folder.id)])]);
+  }, [folderPath]);
 
   useEffect(() => {
     if (!dialogState) {
@@ -151,12 +284,37 @@ export function DocumentsExplorer() {
       return;
     }
 
+    if (dialogState.type === "move-folder") {
+      setTargetFolderId(dialogState.currentParentFolderId ?? "root");
+      return;
+    }
+
+    if (dialogState.type === "duplicate-document") {
+      setTargetFolderId(dialogState.currentFolderId ?? "root");
+      return;
+    }
+
+    if (dialogState.type === "duplicate-folder") {
+      setTargetFolderId(dialogState.currentParentFolderId ?? "root");
+      return;
+    }
+
+    if (dialogState.type === "bulk-move" || dialogState.type === "bulk-duplicate") {
+      setTargetFolderId(selectedFolderId ?? "root");
+      return;
+    }
+
     setDialogInputValue("");
     setTargetFolderId("root");
-  }, [dialogState]);
+  }, [dialogState, selectedFolderId]);
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
+  };
+
+  const clearSelection = () => {
+    setSelectedDocumentIds([]);
+    setSelectedFolderIds([]);
   };
 
   const handleUploadChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -218,6 +376,23 @@ export function DocumentsExplorer() {
           if (selectedFolderId === dialogState.folderId) {
             setSelectedFolderId(null);
           }
+          setSelectedFolderIds((current) => current.filter((id) => id !== dialogState.folderId));
+          break;
+        }
+        case "move-folder": {
+          await documentsService.moveFolder({
+            folderId: dialogState.folderId,
+            userId: user.id,
+            targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+          });
+          break;
+        }
+        case "duplicate-folder": {
+          await documentsService.duplicateFolder({
+            folderId: dialogState.folderId,
+            userId: user.id,
+            targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+          });
           break;
         }
         case "rename-document": {
@@ -230,6 +405,7 @@ export function DocumentsExplorer() {
         }
         case "delete-document": {
           await documentsService.deleteDocument(dialogState.documentId);
+          setSelectedDocumentIds((current) => current.filter((id) => id !== dialogState.documentId));
           didChangeDashboardDocuments = true;
           break;
         }
@@ -239,6 +415,69 @@ export function DocumentsExplorer() {
             targetFolderId === "root" ? null : targetFolderId,
           );
           didChangeDashboardDocuments = true;
+          break;
+        }
+        case "duplicate-document": {
+          await documentsService.duplicateDocument({
+            documentId: dialogState.documentId,
+            userId: user.id,
+            targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+          });
+          didChangeDashboardDocuments = true;
+          break;
+        }
+        case "bulk-move": {
+          if (selectedFolderIds.length > 0) {
+            await documentsService.bulkMoveFolders({
+              folderIds: selectedFolderIds,
+              userId: user.id,
+              targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+            });
+          }
+
+          if (selectedDocumentIds.length > 0) {
+            await documentsService.bulkMoveDocuments(
+              selectedDocumentIds,
+              targetFolderId === "root" ? null : targetFolderId,
+            );
+            didChangeDashboardDocuments = true;
+          }
+
+          clearSelection();
+          break;
+        }
+        case "bulk-delete": {
+          if (selectedFolderIds.length > 0) {
+            await documentsService.bulkDeleteFolders(selectedFolderIds);
+          }
+
+          if (selectedDocumentIds.length > 0) {
+            await documentsService.bulkDeleteDocuments(selectedDocumentIds);
+            didChangeDashboardDocuments = true;
+          }
+
+          clearSelection();
+          break;
+        }
+        case "bulk-duplicate": {
+          if (selectedFolderIds.length > 0) {
+            await documentsService.bulkDuplicateFolders({
+              folderIds: selectedFolderIds,
+              userId: user.id,
+              targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+            });
+          }
+
+          if (selectedDocumentIds.length > 0) {
+            await documentsService.bulkDuplicateDocuments({
+              documentIds: selectedDocumentIds,
+              userId: user.id,
+              targetFolderId: targetFolderId === "root" ? null : targetFolderId,
+            });
+            didChangeDashboardDocuments = true;
+          }
+
+          clearSelection();
           break;
         }
       }
@@ -261,10 +500,78 @@ export function DocumentsExplorer() {
   };
 
   const visibleDocuments = useMemo(() => documents, [documents]);
-  const moveTargets = useMemo(
-    () => folders.filter((folder) => folder.id !== selectedFolderId),
-    [folders, selectedFolderId],
-  );
+  const folderTree = useMemo(() => buildFolderTree(folders), [folders]);
+  const selectedCount = selectedDocumentIds.length + selectedFolderIds.length;
+  const allFolderIds = useMemo(() => folders.map((folder) => folder.id), [folders]);
+
+  const moveTargets = useMemo(() => {
+    const blockedFolderIds = new Set<string>();
+
+    if (dialogState?.type === "move-folder") {
+      blockedFolderIds.add(dialogState.folderId);
+    }
+
+    for (const folderId of selectedFolderIds) {
+      blockedFolderIds.add(folderId);
+    }
+
+    return folders.filter((folder) => !blockedFolderIds.has(folder.id));
+  }, [dialogState, folders, selectedFolderIds]);
+
+  const toggleExpanded = (folderId: string) => {
+    setExpandedFolderIds((current) =>
+      current.includes(folderId)
+        ? current.filter((id) => id !== folderId)
+        : [...current, folderId],
+    );
+  };
+
+  const toggleFolderSelection = (folderId: string) => {
+    setSelectedFolderIds((current) =>
+      current.includes(folderId)
+        ? current.filter((id) => id !== folderId)
+        : [...current, folderId],
+    );
+  };
+
+  const toggleDocumentSelection = (documentId: string) => {
+    setSelectedDocumentIds((current) =>
+      current.includes(documentId)
+        ? current.filter((id) => id !== documentId)
+        : [...current, documentId],
+    );
+  };
+
+  const selectAllVisible = () => {
+    setSelectedFolderIds(childFolders.map((folder) => folder.id));
+    setSelectedDocumentIds(visibleDocuments.map((document) => document.id));
+  };
+
+  const handleDropOnFolder = async (event: React.DragEvent, targetFolderId: string | null) => {
+    event.preventDefault();
+    const payload = parseDropPayload(event);
+
+    if (!payload || !user) {
+      return;
+    }
+
+    try {
+      if (payload.kind === "folder") {
+        await documentsService.moveFolder({
+          folderId: payload.folderId,
+          userId: user.id,
+          targetFolderId,
+        });
+      } else {
+        await documentsService.moveDocument(payload.documentId, targetFolderId);
+        invalidateDashboardCache();
+      }
+
+      await loadExplorer();
+    } catch (dropError) {
+      setError(dropError instanceof Error ? dropError.message : "Unable to move item.");
+    }
+  };
 
   const getFileIcon = (type: string) => {
     const iconClass = "w-5 h-5";
@@ -285,6 +592,65 @@ export function DocumentsExplorer() {
     }
   };
 
+  const renderFolderActions = (folder: any) => (
+    <div className="flex items-center gap-1">
+      <button
+        onClick={(event) => {
+          event.stopPropagation();
+          setDialogState({
+            type: "move-folder",
+            folderId: folder.id,
+            currentName: folder.name,
+            currentParentFolderId: folder.parent_folder_id,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <ArrowRightLeft className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.stopPropagation();
+          setDialogState({
+            type: "duplicate-folder",
+            folderId: folder.id,
+            currentName: folder.name,
+            currentParentFolderId: folder.parent_folder_id,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <Copy className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.stopPropagation();
+          setDialogState({
+            type: "rename-folder",
+            folderId: folder.id,
+            currentName: folder.name,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <Pencil className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.stopPropagation();
+          setDialogState({
+            type: "delete-folder",
+            folderId: folder.id,
+            currentName: folder.name,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-red-600"
+      >
+        <Trash2 className="w-4 h-4" />
+      </button>
+    </div>
+  );
+
   const renderDocumentActions = (doc: any) => (
     <div className="flex items-center gap-1">
       <button
@@ -301,6 +667,21 @@ export function DocumentsExplorer() {
         className="p-1 text-gray-400 hover:text-gray-700"
       >
         <ArrowRightLeft className="w-4 h-4" />
+      </button>
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setDialogState({
+            type: "duplicate-document",
+            documentId: doc.id,
+            currentTitle: doc.title,
+            currentFolderId: doc.folder_id,
+          });
+        }}
+        className="p-1 text-gray-400 hover:text-gray-700"
+      >
+        <Copy className="w-4 h-4" />
       </button>
       <button
         onClick={(event) => {
@@ -332,6 +713,62 @@ export function DocumentsExplorer() {
       </button>
     </div>
   );
+
+  const renderTreeNode = (node: FolderNode, depth = 0): React.ReactNode => {
+    const isExpanded = expandedFolderIds.includes(node.id);
+    const isSelected = selectedFolderId === node.id;
+    const isChecked = selectedFolderIds.includes(node.id);
+    const hasChildren = node.children.length > 0;
+
+    return (
+      <div key={node.id} className="select-none">
+        <div
+          className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm ${
+            isSelected ? "bg-indigo-50 text-indigo-700" : "text-gray-700 hover:bg-gray-100"
+          }`}
+          style={{ paddingLeft: `${depth * 16 + 8}px` }}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => void handleDropOnFolder(event, node.id)}
+        >
+          <button
+            type="button"
+            onClick={() => (hasChildren ? toggleExpanded(node.id) : setSelectedFolderId(node.id))}
+            className="flex h-5 w-5 items-center justify-center text-gray-400"
+          >
+            {hasChildren ? (
+              isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />
+            ) : (
+              <span className="h-4 w-4" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => toggleFolderSelection(node.id)}
+            className="text-gray-400 hover:text-indigo-600"
+          >
+            {isChecked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+          </button>
+          <button
+            type="button"
+            draggable
+            onDragStart={(event) => {
+              event.dataTransfer.effectAllowed = "move";
+              event.dataTransfer.setData(
+                "application/json",
+                JSON.stringify({ kind: "folder", folderId: node.id } satisfies DragPayload),
+              );
+            }}
+            onClick={() => setSelectedFolderId(node.id)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <Folder className="h-4 w-4 flex-shrink-0 text-indigo-600" />
+            <span className="truncate">{node.name}</span>
+          </button>
+        </div>
+        {isExpanded ? node.children.map((child) => renderTreeNode(child, depth + 1)) : null}
+      </div>
+    );
+  };
 
   return (
     <div className="h-full overflow-auto">
@@ -399,9 +836,48 @@ export function DocumentsExplorer() {
         ) : null}
       </div>
 
-      <div className="p-8">
+      <div className="px-8 pb-8 pt-6">
+        {selectedCount > 0 ? (
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
+            <div className="text-sm text-indigo-900">
+              {selectedCount} item{selectedCount === 1 ? "" : "s"} selected
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => setDialogState({ type: "bulk-move" })}
+                className="rounded-lg border border-indigo-200 bg-white px-3 py-2 text-sm text-indigo-700 hover:bg-indigo-100"
+              >
+                Move
+              </button>
+              <button
+                onClick={() => setDialogState({ type: "bulk-duplicate" })}
+                className="rounded-lg border border-indigo-200 bg-white px-3 py-2 text-sm text-indigo-700 hover:bg-indigo-100"
+              >
+                Duplicate
+              </button>
+              <button
+                onClick={() => setDialogState({ type: "bulk-delete" })}
+                className="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50"
+              >
+                Delete
+              </button>
+              <button
+                onClick={clearSelection}
+                className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+        ) : null}
+
         <div className="mb-4 flex items-center gap-2 text-sm text-gray-500">
-          <button onClick={() => setSelectedFolderId(null)} className="hover:text-indigo-600">
+          <button
+            onClick={() => setSelectedFolderId(null)}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => void handleDropOnFolder(event, null)}
+            className="hover:text-indigo-600"
+          >
             My Notes
           </button>
           {folderPath.map((folder) => (
@@ -414,153 +890,260 @@ export function DocumentsExplorer() {
           ))}
         </div>
 
-        <div className="mb-8">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider">Folders</h2>
-            {selectedFolderId ? (
-              <button onClick={() => setSelectedFolderId(null)} className="text-sm text-indigo-600">
-                View all documents
+        <div className="flex flex-col gap-6 lg:min-h-[calc(100vh-240px)] lg:flex-row lg:gap-0">
+          <aside className="lg:w-64 lg:flex-shrink-0 xl:w-72">
+            <div className="h-full rounded-l-2xl border border-gray-200 bg-white p-4 lg:sticky lg:top-6 lg:min-h-[calc(100vh-240px)] lg:rounded-r-none lg:border-r-0">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
+              <h2 className="text-sm font-medium uppercase tracking-wider text-gray-700">Folders</h2>
+              <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-right">
+                <button
+                  onClick={selectAllVisible}
+                  className="text-xs text-indigo-600 hover:text-indigo-700"
+                >
+                  Select visible
+                </button>
+                <button
+                  onClick={() => setExpandedFolderIds(allFolderIds)}
+                  className="text-xs text-indigo-600 hover:text-indigo-700"
+                >
+                  Expand all
+                </button>
+                <button
+                  onClick={() => setExpandedFolderIds([])}
+                  className="text-xs text-indigo-600 hover:text-indigo-700"
+                >
+                  Collapse all
+                </button>
+              </div>
+            </div>
+            <div
+              className={`mb-3 rounded-xl border px-3 py-2 text-sm ${
+                selectedFolderId === null ? "border-indigo-200 bg-indigo-50 text-indigo-700" : "border-gray-200 text-gray-700"
+              }`}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => void handleDropOnFolder(event, null)}
+            >
+              <button onClick={() => setSelectedFolderId(null)} className="flex w-full items-center gap-2 text-left">
+                <Folder className="h-4 w-4 text-indigo-600" />
+                <span>Root / My Notes</span>
               </button>
-            ) : null}
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {childFolders.map((folder) => (
-              <div
-                key={folder.id}
-                className={`bg-white border rounded-xl p-5 hover:shadow-sm transition-all cursor-pointer ${
-                  selectedFolderId === folder.id
-                    ? "border-indigo-400"
-                    : "border-gray-200 hover:border-indigo-300"
-                }`}
-                onClick={() => setSelectedFolderId(folder.id)}
-              >
-                <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 bg-indigo-50 rounded-lg flex items-center justify-center flex-shrink-0">
-                    <Folder className="w-5 h-5 text-indigo-600" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-2">
-                      <h3 className="font-medium text-gray-900 mb-1 truncate">{folder.name}</h3>
-                      <div className="flex items-center gap-1">
+            </div>
+            <div className="max-h-[calc(100vh-340px)] space-y-1 overflow-auto pr-1">
+              {folderTree.map((node) => renderTreeNode(node))}
+              {folderTree.length === 0 && !isLoading ? (
+                <div className="rounded-lg border border-dashed border-gray-200 px-3 py-4 text-sm text-gray-500">
+                  No folders yet.
+                </div>
+              ) : null}
+            </div>
+            </div>
+          </aside>
+
+          <div className="min-w-0 flex-1 overflow-hidden rounded-r-2xl border border-gray-200 bg-white p-6 lg:rounded-l-none">
+            <div className="mb-8">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider">Folders</h2>
+                {selectedFolderId ? (
+                  <button onClick={() => setSelectedFolderId(null)} className="text-sm text-indigo-600">
+                    View all documents
+                  </button>
+                ) : null}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {childFolders.map((folder) => {
+                  const isChecked = selectedFolderIds.includes(folder.id);
+
+                  return (
+                    <div
+                      key={folder.id}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.effectAllowed = "move";
+                        event.dataTransfer.setData(
+                          "application/json",
+                          JSON.stringify({ kind: "folder", folderId: folder.id } satisfies DragPayload),
+                        );
+                      }}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={(event) => void handleDropOnFolder(event, folder.id)}
+                      className={`bg-white border rounded-xl p-5 hover:shadow-sm transition-all cursor-pointer ${
+                        selectedFolderId === folder.id
+                          ? "border-indigo-400"
+                          : "border-gray-200 hover:border-indigo-300"
+                      }`}
+                      onClick={() => setSelectedFolderId(folder.id)}
+                    >
+                      <div className="mb-3 flex items-start justify-between gap-2">
                         <button
+                          type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            setDialogState({
-                              type: "rename-folder",
-                              folderId: folder.id,
-                              currentName: folder.name,
-                            });
+                            toggleFolderSelection(folder.id);
                           }}
-                          className="p-1 text-gray-400 hover:text-gray-700"
+                          className="text-gray-400 hover:text-indigo-600"
                         >
-                          <Pencil className="w-4 h-4" />
+                          {isChecked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
                         </button>
-                        <button
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setDialogState({
-                              type: "delete-folder",
-                              folderId: folder.id,
-                              currentName: folder.name,
-                            });
-                          }}
-                          className="p-1 text-gray-400 hover:text-red-600"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        {renderFolderActions(folder)}
+                      </div>
+                      <div className="flex items-start gap-3">
+                        <div className="w-10 h-10 bg-indigo-50 rounded-lg flex items-center justify-center flex-shrink-0">
+                          <Folder className="w-5 h-5 text-indigo-600" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <h3 className="font-medium text-gray-900 mb-1 truncate">{folder.name}</h3>
+                          <p className="text-sm text-gray-500">
+                            {folder.childCount} folders • {folder.fileCount} files
+                          </p>
+                        </div>
                       </div>
                     </div>
-                    <p className="text-sm text-gray-500">
-                      {folder.childCount} folders • {folder.fileCount} files
-                    </p>
+                  );
+                })}
+                {childFolders.length === 0 && !isLoading ? (
+                  <div className="col-span-full bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-500">
+                    No folders here yet. Create one to keep building your study space.
                   </div>
+                ) : null}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider">Documents</h2>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={selectAllVisible}
+                    className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                  >
+                    Select visible
+                  </button>
+                  {selectedCount > 0 ? (
+                    <button
+                      onClick={clearSelection}
+                      className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    >
+                      <span className="flex items-center gap-2"><X className="h-4 w-4" /> Clear selection</span>
+                    </button>
+                  ) : null}
                 </div>
               </div>
-            ))}
-            {childFolders.length === 0 && !isLoading ? (
-              <div className="col-span-full bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-500">
-                No folders here yet. Create one to keep building your study space.
-              </div>
-            ) : null}
+
+              {isLoading ? (
+                <div className="bg-white border border-gray-200 rounded-xl p-6 text-sm text-gray-500">
+                  Loading documents...
+                </div>
+              ) : viewMode === "grid" ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  {visibleDocuments.map((doc) => {
+                    const isChecked = selectedDocumentIds.includes(doc.id);
+
+                    return (
+                      <div
+                        key={doc.id}
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData(
+                            "application/json",
+                            JSON.stringify({ kind: "document", documentId: doc.id } satisfies DragPayload),
+                          );
+                        }}
+                        className="bg-white border border-gray-200 rounded-xl p-5 hover:border-indigo-300 hover:shadow-sm transition-all"
+                      >
+                        <div className="mb-3 flex items-start justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleDocumentSelection(doc.id)}
+                            className="text-gray-400 hover:text-indigo-600"
+                          >
+                            {isChecked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                          </button>
+                          <div className="flex items-center gap-2">
+                            <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-indigo-700">
+                              {getDocumentTypeLabel(doc.mime_type, doc.original_filename)}
+                            </span>
+                            {renderDocumentActions(doc)}
+                          </div>
+                        </div>
+                        <Link to={`/notes/${doc.id}`} className="block">
+                          <div className="mb-3 w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
+                            {getFileIcon(doc.mime_type)}
+                          </div>
+                          <h3 className="font-medium text-gray-900 mb-2 line-clamp-2">{doc.title}</h3>
+                          <div className="flex items-center justify-between text-sm mb-3">
+                            <span className="text-gray-500">Progress</span>
+                            <span className="font-medium text-indigo-600">{doc.completion_percent}%</span>
+                          </div>
+                          <div className="w-full bg-gray-200 rounded-full h-2 mb-3">
+                            <div
+                              className="bg-indigo-600 h-2 rounded-full"
+                              style={{ width: `${doc.completion_percent}%` }}
+                            ></div>
+                          </div>
+                          <p className="text-xs text-gray-500">
+                            Last studied {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleString() : "Not yet"}
+                          </p>
+                        </Link>
+                      </div>
+                    );
+                  })}
+                  {visibleDocuments.length === 0 ? (
+                    <div className="col-span-full bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-500">
+                      No documents match this view yet.
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                  {visibleDocuments.map((doc) => {
+                    const isChecked = selectedDocumentIds.includes(doc.id);
+
+                    return (
+                      <div
+                        key={doc.id}
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData(
+                            "application/json",
+                            JSON.stringify({ kind: "document", documentId: doc.id } satisfies DragPayload),
+                          );
+                        }}
+                        className="flex items-center gap-4 px-6 py-4 border-b border-gray-100 last:border-b-0 hover:bg-gray-50"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => toggleDocumentSelection(doc.id)}
+                          className="text-gray-400 hover:text-indigo-600"
+                        >
+                          {isChecked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                        </button>
+                        <Link to={`/notes/${doc.id}`} className="flex min-w-0 flex-1 items-center gap-4">
+                          <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
+                            {getFileIcon(doc.mime_type)}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="font-medium text-gray-900 truncate">{doc.title}</div>
+                            <div className="text-sm text-gray-500">
+                              {getDocumentTypeLabel(doc.mime_type, doc.original_filename)} • {doc.completion_percent}% complete
+                            </div>
+                          </div>
+                        </Link>
+                        <div className="text-sm text-gray-500">
+                          {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleDateString() : "Not studied"}
+                        </div>
+                        {renderDocumentActions(doc)}
+                      </div>
+                    );
+                  })}
+                  {visibleDocuments.length === 0 ? (
+                    <div className="p-6 text-sm text-gray-500">No documents match this view yet.</div>
+                  ) : null}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-
-        <div>
-          <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-4">Documents</h2>
-
-          {isLoading ? (
-            <div className="bg-white border border-gray-200 rounded-xl p-6 text-sm text-gray-500">
-              Loading documents...
-            </div>
-          ) : viewMode === "grid" ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              {visibleDocuments.map((doc) => (
-                <Link
-                  key={doc.id}
-                  to={`/notes/${doc.id}`}
-                  className="bg-white border border-gray-200 rounded-xl p-5 hover:border-indigo-300 hover:shadow-sm transition-all"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                      {getFileIcon(doc.mime_type)}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-indigo-700">
-                        {getDocumentTypeLabel(doc.mime_type, doc.original_filename)}
-                      </span>
-                      {renderDocumentActions(doc)}
-                    </div>
-                  </div>
-                  <h3 className="font-medium text-gray-900 mb-2 line-clamp-2">{doc.title}</h3>
-                  <div className="flex items-center justify-between text-sm mb-3">
-                    <span className="text-gray-500">Progress</span>
-                    <span className="font-medium text-indigo-600">{doc.completion_percent}%</span>
-                  </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2 mb-3">
-                    <div
-                      className="bg-indigo-600 h-2 rounded-full"
-                      style={{ width: `${doc.completion_percent}%` }}
-                    ></div>
-                  </div>
-                  <p className="text-xs text-gray-500">
-                    Last studied {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleString() : "Not yet"}
-                  </p>
-                </Link>
-              ))}
-              {visibleDocuments.length === 0 ? (
-                <div className="col-span-full bg-white border border-dashed border-gray-300 rounded-xl p-6 text-sm text-gray-500">
-                  No documents match this view yet.
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-              {visibleDocuments.map((doc) => (
-                <Link
-                  key={doc.id}
-                  to={`/notes/${doc.id}`}
-                  className="flex items-center gap-4 px-6 py-4 border-b border-gray-100 last:border-b-0 hover:bg-gray-50"
-                >
-                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                    {getFileIcon(doc.mime_type)}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-gray-900 truncate">{doc.title}</div>
-                    <div className="text-sm text-gray-500">
-                      {getDocumentTypeLabel(doc.mime_type, doc.original_filename)} • {doc.completion_percent}% complete
-                    </div>
-                  </div>
-                  <div className="text-sm text-gray-500">
-                    {doc.last_opened_at ? new Date(doc.last_opened_at).toLocaleDateString() : "Not studied"}
-                  </div>
-                  {renderDocumentActions(doc)}
-                </Link>
-              ))}
-              {visibleDocuments.length === 0 ? (
-                <div className="p-6 text-sm text-gray-500">No documents match this view yet.</div>
-              ) : null}
-            </div>
-          )}
         </div>
       </div>
 
@@ -571,17 +1154,29 @@ export function DocumentsExplorer() {
               {dialogState?.type === "create-folder" && "Create Folder"}
               {dialogState?.type === "rename-folder" && "Rename Folder"}
               {dialogState?.type === "delete-folder" && "Delete Folder"}
+              {dialogState?.type === "move-folder" && "Move Folder"}
+              {dialogState?.type === "duplicate-folder" && "Duplicate Folder"}
               {dialogState?.type === "rename-document" && "Rename Document"}
               {dialogState?.type === "delete-document" && "Delete Document"}
               {dialogState?.type === "move-document" && "Move Document"}
+              {dialogState?.type === "duplicate-document" && "Duplicate Document"}
+              {dialogState?.type === "bulk-move" && "Move Selected Items"}
+              {dialogState?.type === "bulk-delete" && "Delete Selected Items"}
+              {dialogState?.type === "bulk-duplicate" && "Duplicate Selected Items"}
             </DialogTitle>
             <DialogDescription>
               {dialogState?.type === "create-folder" && "Create a new folder in the current location."}
               {dialogState?.type === "rename-folder" && "Update the folder name."}
               {dialogState?.type === "delete-folder" && "This removes the folder structure. Documents remain in your library."}
+              {dialogState?.type === "move-folder" && "Move this folder into another folder or back to the root."}
+              {dialogState?.type === "duplicate-folder" && "Create a recursive copy of this folder and everything inside it."}
               {dialogState?.type === "rename-document" && "Update the document title shown across the app."}
               {dialogState?.type === "delete-document" && "This removes the document, extracted content, and stored file."}
               {dialogState?.type === "move-document" && "Move this document into another folder or back to the root."}
+              {dialogState?.type === "duplicate-document" && "Create a copied document with duplicated file content."}
+              {dialogState?.type === "bulk-move" && "Move all selected folders and documents together."}
+              {dialogState?.type === "bulk-delete" && "Delete all selected folders and documents."}
+              {dialogState?.type === "bulk-duplicate" && "Duplicate all selected folders and documents."}
             </DialogDescription>
           </DialogHeader>
 
@@ -597,16 +1192,21 @@ export function DocumentsExplorer() {
             />
           ) : null}
 
-          {dialogState?.type === "move-document" ? (
+          {dialogState?.type === "move-document" ||
+          dialogState?.type === "move-folder" ||
+          dialogState?.type === "duplicate-document" ||
+          dialogState?.type === "duplicate-folder" ||
+          dialogState?.type === "bulk-move" ||
+          dialogState?.type === "bulk-duplicate" ? (
             <select
               value={targetFolderId}
               onChange={(event) => setTargetFolderId(event.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
             >
-              <option value="root">Root / My Notes</option>
+              <option value="root">{buildFolderPathLabel([], null)}</option>
               {moveTargets.map((folder) => (
                 <option key={folder.id} value={folder.id}>
-                  {folder.name}
+                  {buildFolderOptionLabel(folders, folder.id) || folder.name}
                 </option>
               ))}
             </select>
@@ -621,6 +1221,12 @@ export function DocumentsExplorer() {
           {dialogState?.type === "delete-document" ? (
             <div className="rounded-lg border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
               Delete document "{dialogState.currentTitle}"?
+            </div>
+          ) : null}
+
+          {dialogState?.type === "bulk-delete" ? (
+            <div className="rounded-lg border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+              Delete {selectedFolderIds.length} folder(s) and {selectedDocumentIds.length} document(s)?
             </div>
           ) : null}
 

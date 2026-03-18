@@ -3,23 +3,50 @@ type CacheEnvelope<T> = {
   timestamp: number;
 };
 
-function readEnvelope<T>(key: string): CacheEnvelope<T> | null {
+export const UI_CACHE_MAX_AGE = 1000 * 60 * 30;
+export const THEME_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 30;
+
+function getSessionStorage() {
   if (typeof window === "undefined") {
     return null;
   }
 
-  const raw = window.sessionStorage.getItem(key);
+  return window.sessionStorage;
+}
 
-  if (!raw) {
+function getLocalStorage() {
+  if (typeof window === "undefined") {
     return null;
   }
 
-  try {
-    return JSON.parse(raw) as CacheEnvelope<T>;
-  } catch {
-    window.sessionStorage.removeItem(key);
-    return null;
+  return window.localStorage;
+}
+
+function readEnvelope<T>(key: string): CacheEnvelope<T> | null {
+  const storages = [getSessionStorage(), getLocalStorage()].filter(Boolean);
+
+  for (const storage of storages) {
+    const raw = storage.getItem(key);
+
+    if (!raw) {
+      continue;
+    }
+
+    try {
+      const envelope = JSON.parse(raw) as CacheEnvelope<T>;
+      const sessionStorage = getSessionStorage();
+
+      if (storage === getLocalStorage() && sessionStorage) {
+        sessionStorage.setItem(key, raw);
+      }
+
+      return envelope;
+    } catch {
+      storage.removeItem(key);
+    }
   }
+
+  return null;
 }
 
 export function readSessionCache<T>(key: string, maxAgeMs = 1000 * 60 * 10): T | null {
@@ -30,7 +57,7 @@ export function readSessionCache<T>(key: string, maxAgeMs = 1000 * 60 * 10): T |
   }
 
   if (Date.now() - envelope.timestamp > maxAgeMs) {
-    window.sessionStorage.removeItem(key);
+    removeSessionCache(key);
     return null;
   }
 
@@ -48,7 +75,10 @@ export function isSessionCacheFresh(key: string, maxAgeMs = 1000 * 60 * 10) {
 }
 
 export function writeSessionCache<T>(key: string, value: T) {
-  if (typeof window === "undefined") {
+  const sessionStorage = getSessionStorage();
+  const localStorage = getLocalStorage();
+
+  if (!sessionStorage && !localStorage) {
     return;
   }
 
@@ -57,13 +87,12 @@ export function writeSessionCache<T>(key: string, value: T) {
     timestamp: Date.now(),
   };
 
-  window.sessionStorage.setItem(key, JSON.stringify(payload));
+  const raw = JSON.stringify(payload);
+  sessionStorage?.setItem(key, raw);
+  localStorage?.setItem(key, raw);
 }
 
 export function removeSessionCache(key: string) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  window.sessionStorage.removeItem(key);
+  getSessionStorage()?.removeItem(key);
+  getLocalStorage()?.removeItem(key);
 }

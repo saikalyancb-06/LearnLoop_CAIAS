@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ChevronLeft, TrendingUp, CheckCircle, AlertTriangle, RotateCcw, BookOpen } from "lucide-react";
 import { Link, useParams } from "react-router";
 import { feynmanService } from "../../services/feynmanService";
+import { MarkdownText } from "../components/MarkdownText";
 
 export function FeynmanResults() {
   const { documentId, sessionId } = useParams();
@@ -88,6 +89,11 @@ export function FeynmanResults() {
                 ? "Good effort! There are a few areas to improve."
                 : "Keep practicing. Review the weak concepts and try again."}
           </p>
+          {result.knowledge_rating ? (
+            <div className="mt-4 inline-flex rounded-full bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700">
+              Knowledge Rating: {result.knowledge_rating}
+            </div>
+          ) : null}
         </div>
 
         <div className="bg-white border border-gray-200 rounded-xl p-6 mb-8">
@@ -142,10 +148,24 @@ export function FeynmanResults() {
           </div>
         </div>
 
+        {Array.isArray(result.misconceptions) && result.misconceptions.length > 0 ? (
+          <div className="bg-white border border-gray-200 rounded-xl p-6 mb-8">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Detected Misconceptions</h2>
+            <ul className="space-y-3">
+              {result.misconceptions.map((misconception: string) => (
+                <li key={misconception} className="flex items-start gap-2">
+                  <div className="mt-2 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-red-600"></div>
+                  <span className="text-sm text-gray-700">{misconception}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
         <div className="bg-white border border-gray-200 rounded-xl p-6 mb-8">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">AI Tutor Feedback</h2>
           <div className="prose prose-sm max-w-none text-gray-700">
-            <p>{result.ai_feedback}</p>
+            <MarkdownText content={result.ai_feedback ?? ""} />
           </div>
         </div>
 

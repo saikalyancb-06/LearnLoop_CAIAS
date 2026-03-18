@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft, Sparkles, Send, CreditCard, GraduationCap, FileText } from "lucide-react";
-import { Link, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "react-router";
 import { useAuth } from "../../hooks/useAuth";
 import { documentsService } from "../../services/documentsService";
 import { flashcardsService } from "../../services/flashcardsService";
-import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../../lib/cache";
+import { isSessionCacheFresh, readSessionCache, UI_CACHE_MAX_AGE, writeSessionCache } from "../../lib/cache";
 import { localAiService } from "../../services/localAiService";
+import { MarkdownText } from "../components/MarkdownText";
+import { DocumentMindMap } from "../components/DocumentMindMap";
 
 type ChatMessage = {
   id: string;
@@ -230,8 +232,121 @@ function buildCopilotReply(question: string, documentTitle: string, extractedTex
     .join("\n");
 }
 
+const GENERIC_FOCUS_WORDS = new Set([
+  "overview",
+  "section",
+  "document",
+  "topic",
+  "concept",
+  "chapter",
+  "unit",
+  "introduction",
+  "summary",
+  "part",
+  "lesson",
+  "module",
+  "hash",
+  "probing",
+  "quadratic",
+  "mod",
+  "table",
+  "item",
+]);
+
+function normalizeWhitespace(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function splitIntoSentences(value: string) {
+  return normalizeWhitespace(value)
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+}
+
+function isGenericTopic(value: string, documentTitle: string) {
+  const normalized = normalizeWhitespace(value).toLowerCase();
+
+  if (!normalized) {
+    return true;
+  }
+
+  if (normalized === normalizeWhitespace(documentTitle).toLowerCase()) {
+    return true;
+  }
+
+  if (/^section\s+\d+/i.test(normalized) || /^chapter\s+\d+/i.test(normalized) || /^unit\s+\d+/i.test(normalized)) {
+    return true;
+  }
+
+  const tokens = normalized.match(/[a-z0-9]{3,}/g) ?? [];
+
+  if (tokens.length <= 1) {
+    return true;
+  }
+
+  return tokens.every((token) => GENERIC_FOCUS_WORDS.has(token));
+}
+
+function extractSectionFocus(section: any, documentTitle: string) {
+  const title = normalizeWhitespace(section?.title ?? "");
+  const sectionContent = typeof section?.content === "string" ? section.content : "";
+  const bestSentence =
+    splitIntoSentences(sectionContent).find((sentence) => {
+      const tokens = sentence.match(/[a-z0-9]{3,}/gi) ?? [];
+      return tokens.length >= 5 && !isGenericTopic(sentence, documentTitle);
+    }) ?? "";
+
+  if (bestSentence) {
+    return truncateText(bestSentence, 80);
+  }
+
+  if (title && !isGenericTopic(title, documentTitle)) {
+    return truncateText(title, 80);
+  }
+
+  return "";
+}
+
+function deriveFeynmanTopics(document: any) {
+  const title = typeof document?.title === "string" ? document.title : "Document";
+  const conceptTopics = (Array.isArray(document?.metadata?.concepts) ? document.metadata.concepts : [])
+    .map((concept: any, index: number) => ({
+      id: concept.id ?? `concept-${index}`,
+      label: normalizeWhitespace(concept.label ?? ""),
+    }))
+    .filter((concept: { label: string }) => concept.label)
+    .flatMap((concept) => {
+      const tokens = concept.label.match(/[A-Za-z][A-Za-z-]{2,}/g) ?? [];
+      return tokens.map((token, index) => ({
+        id: `${concept.id}-token-${index}`,
+        label: token.replace(/^\w/, (char) => char.toUpperCase()),
+      }));
+    })
+    .filter((topic: { label: string }) => !isGenericTopic(topic.label, title))
+    .filter((topic: { label: string }, index: number, values: Array<{ label: string }>) =>
+      values.findIndex((candidate) => candidate.label.toLowerCase() === topic.label.toLowerCase()) === index,
+    );
+
+  if (conceptTopics.length > 0) {
+    return conceptTopics.slice(0, 6);
+  }
+
+  return (Array.isArray(document?.sections) ? document.sections : [])
+    .map((section: any, index: number) => ({
+      id: section.id ?? `section-topic-${index}`,
+      label: extractSectionFocus(section, title),
+    }))
+    .filter((topic: { label: string }, index: number, values: Array<{ label: string }>) =>
+      topic.label && !isGenericTopic(topic.label, title) &&
+      values.findIndex((candidate) => candidate.label === topic.label) === index,
+    )
+    .slice(0, 6);
+}
+
 export function DocumentWorkspace() {
   const { documentId } = useParams();
+  const navigate = useNavigate();
   const { user } = useAuth();
   const [chatInput, setChatInput] = useState(() => readSessionCache(`workspace.${documentId}.chatInput`) ?? "");
   const [activeTab, setActiveTab] = useState<"flashcards" | "feynman" | "notes">("flashcards");
@@ -243,6 +358,7 @@ export function DocumentWorkspace() {
   const [isSavingNotes, setIsSavingNotes] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedFeynmanTopic, setSelectedFeynmanTopic] = useState<string | null>(null);
 
   async function loadWorkspace() {
     if (!documentId) {
@@ -292,8 +408,8 @@ export function DocumentWorkspace() {
     if (
       documentId &&
       readSessionCache(`workspace.${documentId}.document`) &&
-      isSessionCacheFresh(`workspace.${documentId}.document`, 1000 * 60 * 3) &&
-      isSessionCacheFresh(`workspace.${documentId}.flashcards`, 1000 * 60 * 3)
+      isSessionCacheFresh(`workspace.${documentId}.document`, UI_CACHE_MAX_AGE) &&
+      isSessionCacheFresh(`workspace.${documentId}.flashcards`, UI_CACHE_MAX_AGE)
     ) {
       setIsLoading(false);
       return;
@@ -313,21 +429,6 @@ export function DocumentWorkspace() {
     writeSessionCache(`workspace.${documentId}.notes`, notes);
     writeSessionCache(`workspace.${documentId}.chatInput`, chatInput);
   }, [chatInput, chatMessages, document, documentId, flashcards, notes]);
-
-  const concepts = useMemo(() => {
-    const rawConcepts = document?.metadata?.concepts;
-
-    if (Array.isArray(rawConcepts) && rawConcepts.length > 0) {
-      return rawConcepts as { id: string; label: string; x: number; y: number }[];
-    }
-
-    return [
-      { id: "1", label: document?.title ?? "Concept", x: 50, y: 20 },
-      { id: "2", label: "Overview", x: 30, y: 50 },
-      { id: "3", label: "Examples", x: 70, y: 50 },
-      { id: "4", label: "Review", x: 50, y: 80 },
-    ];
-  }, [document]);
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -414,6 +515,21 @@ export function DocumentWorkspace() {
     return <div className="p-8 text-sm text-red-600">{error ?? "Document not found."}</div>;
   }
 
+  const feynmanTopics = deriveFeynmanTopics(document);
+
+  const activeFeynmanTopic = selectedFeynmanTopic ?? feynmanTopics[0]?.label ?? document.title;
+
+  const startFeynmanSession = (topic?: string) => {
+    const nextTopic = topic ?? activeFeynmanTopic;
+    const searchParams = new URLSearchParams();
+
+    if (nextTopic?.trim()) {
+      searchParams.set("topic", nextTopic.trim());
+    }
+
+    navigate(`/notes/${document.id}/feynman?${searchParams.toString()}`);
+  };
+
   return (
     <div className="h-full flex flex-col">
       <div className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between">
@@ -441,46 +557,20 @@ export function DocumentWorkspace() {
 
       <div className="flex-1 flex overflow-hidden">
         <div className="w-2/5 border-r border-gray-200 bg-white p-6 overflow-auto">
-          <div className="mb-4">
-            <h2 className="text-sm font-medium text-gray-700 uppercase tracking-wider mb-1">
-              Concept Mind Map
-            </h2>
-            <p className="text-sm text-gray-500">AI-generated concept visualization</p>
-          </div>
-
-          <div className="relative bg-gray-50 rounded-xl border border-gray-200 h-96">
-            {concepts.map((concept) => (
-              <div
-                key={concept.id}
-                className="absolute transform -translate-x-1/2 -translate-y-1/2"
-                style={{ left: `${concept.x}%`, top: `${concept.y}%` }}
-              >
-                <button className="bg-white border-2 border-indigo-600 rounded-lg px-4 py-2 text-sm font-medium text-gray-900 hover:bg-indigo-50 shadow-sm transition-colors">
-                  {concept.label}
-                </button>
-              </div>
-            ))}
-
-            <svg className="absolute inset-0 w-full h-full pointer-events-none">
-              {concepts.slice(1).map((concept) => (
-                <line
-                  key={concept.id}
-                  x1="50%"
-                  y1="20%"
-                  x2={`${concept.x}%`}
-                  y2={`${concept.y}%`}
-                  stroke="#4F46E5"
-                  strokeWidth="2"
-                />
-              ))}
-            </svg>
-          </div>
+          <DocumentMindMap
+            title={document.title}
+            summary={(document.metadata?.summary as string | undefined) ?? document.extracted_text}
+            concepts={Array.isArray(document.metadata?.concepts) ? document.metadata.concepts : []}
+            sections={document.sections}
+          />
 
           <div className="mt-4 space-y-3">
             {document.sections.map((section: any) => (
               <div key={section.id} className="rounded-lg border border-gray-200 bg-white p-4">
                 <div className="text-sm font-medium text-gray-900">{section.title}</div>
-                <div className="mt-2 whitespace-pre-wrap text-sm text-gray-500">{section.content}</div>
+                <div className="mt-2 text-sm text-gray-500">
+                  <MarkdownText content={section.content} />
+                </div>
               </div>
             ))}
           </div>
@@ -521,12 +611,12 @@ export function DocumentWorkspace() {
                         </pre>
                       </div>
                     ) : (
-                      <p
+                      <div
                         key={`${message.id}-text-${index}`}
-                        className="whitespace-pre-wrap break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
+                        className="break-words text-sm leading-relaxed [&:not(:last-child)]:mb-2"
                       >
-                        {message.role === "ai" ? formatDenseStudyText(part.content) : part.content}
-                      </p>
+                        <MarkdownText content={part.content} />
+                      </div>
                     ),
                   )}
                 </div>
@@ -644,19 +734,29 @@ export function DocumentWorkspace() {
                   Test your understanding by teaching these concepts back to the AI.
                 </p>
                 <div className="space-y-3">
-                  {concepts.slice(0, 3).map((concept) => (
-                    <div key={concept.id} className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                  {feynmanTopics.map((concept) => (
+                    <button
+                      key={concept.id}
+                      type="button"
+                      onClick={() => setSelectedFeynmanTopic(concept.label)}
+                      className={`block w-full rounded-lg border p-4 text-left transition-colors ${
+                        activeFeynmanTopic === concept.label
+                          ? "border-indigo-300 bg-indigo-50"
+                          : "border-gray-200 bg-gray-50 hover:border-indigo-300"
+                      }`}
+                    >
                       <p className="text-sm font-medium text-gray-900 mb-2">{concept.label}</p>
                       <p className="text-xs text-gray-500">Ready to teach</p>
-                    </div>
+                    </button>
                   ))}
                 </div>
-                <Link
-                  to={`/notes/${document.id}/feynman`}
+                <button
+                  type="button"
+                  onClick={() => startFeynmanSession()}
                   className="block mt-4 w-full px-4 py-2 bg-indigo-600 text-white text-center rounded-lg hover:bg-indigo-700 transition-colors"
                 >
                   Start Teaching Session
-                </Link>
+                </button>
               </div>
             )}
 

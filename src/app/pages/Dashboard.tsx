@@ -5,7 +5,7 @@ import { useAuth } from "../../hooks/useAuth";
 import { dashboardService } from "../../services/dashboardService";
 import { documentsService } from "../../services/documentsService";
 import { getDocumentTypeLabel } from "../../lib/documentDisplay";
-import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../../lib/cache";
+import { isSessionCacheFresh, readSessionCache, UI_CACHE_MAX_AGE, writeSessionCache } from "../../lib/cache";
 
 export function Dashboard() {
   const navigate = useNavigate();
@@ -55,12 +55,8 @@ export function Dashboard() {
   }
 
   useEffect(() => {
-    if (
-      readSessionCache("dashboard.documents") &&
-      isSessionCacheFresh("dashboard.documents", 1000 * 60 * 3)
-    ) {
+    if (readSessionCache("dashboard.documents") && isSessionCacheFresh("dashboard.documents", UI_CACHE_MAX_AGE)) {
       setIsLoading(false);
-      void loadDashboard({ silent: true });
       return;
     }
 

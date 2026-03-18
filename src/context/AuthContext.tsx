@@ -11,7 +11,7 @@ import type { AuthChangeEvent, Session, User } from "@supabase/supabase-js";
 import { authService } from "../services/authService";
 import { supabase } from "../lib/supabaseClient";
 import type { TableRow } from "../types/database";
-import { isSessionCacheFresh, readSessionCache, writeSessionCache } from "../lib/cache";
+import { isSessionCacheFresh, readSessionCache, THEME_CACHE_MAX_AGE, UI_CACHE_MAX_AGE, writeSessionCache } from "../lib/cache";
 
 type AuthContextValue = {
   session: Session | null;
@@ -29,7 +29,7 @@ type AuthProviderProps = {
   children: ReactNode;
 };
 
-const AUTH_CACHE_MAX_AGE = 1000 * 60 * 30;
+const AUTH_CACHE_MAX_AGE = UI_CACHE_MAX_AGE;
 
 async function fetchProfile(userId: string) {
   const { data, error } = await supabase
@@ -208,7 +208,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       profile.preferences &&
       "darkMode" in profile.preferences
         ? Boolean(profile.preferences.darkMode)
-        : readSessionCache<boolean>("theme.darkMode", 1000 * 60 * 60 * 24 * 30) ?? false;
+        : readSessionCache<boolean>("theme.darkMode", THEME_CACHE_MAX_AGE) ?? false;
 
     document.documentElement.classList.toggle("dark", darkMode);
     writeSessionCache("theme.darkMode", darkMode);
